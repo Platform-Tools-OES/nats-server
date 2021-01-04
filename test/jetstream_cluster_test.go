@@ -827,7 +827,6 @@ func TestJetStreamClusterStreamCatchup(t *testing.T) {
 	fmt.Printf("\n\nDELETING MSG %v\n\n", toSend)
 
 	// Delete the first from the second batch.
-	// Now delete a msg.
 	dreq := server.JSApiMsgDeleteRequest{Seq: uint64(toSend)}
 	dreqj, err := json.Marshal(dreq)
 	if err != nil {

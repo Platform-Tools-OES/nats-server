@@ -112,6 +112,7 @@ type StreamState struct {
 	FirstTime time.Time `json:"first_ts"`
 	LastSeq   uint64    `json:"last_seq"`
 	LastTime  time.Time `json:"last_ts"`
+	Deleted   []uint64  `json:"deleted,omitempty"`
 	Consumers int       `json:"consumer_count"`
 }
 

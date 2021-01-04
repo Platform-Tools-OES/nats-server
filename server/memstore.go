@@ -27,6 +27,7 @@ type memStore struct {
 	cfg       StreamConfig
 	state     StreamState
 	msgs      map[uint64]*storedMsg
+	dmap      map[uint64]struct{}
 	scb       StorageUpdateHandler
 	ageChk    *time.Timer
 	consumers int
@@ -47,7 +48,7 @@ func newMemStore(cfg *StreamConfig) (*memStore, error) {
 	if cfg.Storage != MemoryStorage {
 		return nil, fmt.Errorf("memStore requires memory storage type in config")
 	}
-	return &memStore{msgs: make(map[uint64]*storedMsg), cfg: *cfg}, nil
+	return &memStore{msgs: make(map[uint64]*storedMsg), dmap: make(map[uint64]struct{}), cfg: *cfg}, nil
 }
 
 func (ms *memStore) UpdateConfig(cfg *StreamConfig) error {
@@ -264,6 +265,7 @@ func (ms *memStore) Purge() (uint64, error) {
 	ms.state.Bytes = 0
 	ms.state.Msgs = 0
 	ms.msgs = make(map[uint64]*storedMsg)
+	ms.dmap = make(map[uint64]struct{})
 	ms.mu.Unlock()
 
 	if cb != nil {
@@ -374,11 +376,14 @@ func (ms *memStore) EraseMsg(seq uint64) (bool, error) {
 // Lock should be held.
 func (ms *memStore) updateFirstSeq(seq uint64) {
 	if seq != ms.state.FirstSeq {
+		// Interior delete.
+		ms.dmap[seq] = struct{}{}
 		return
 	}
 	var nsm *storedMsg
 	var ok bool
 	for nseq := ms.state.FirstSeq + 1; nseq <= ms.state.LastSeq; nseq++ {
+		delete(ms.dmap, nseq)
 		if nsm, ok = ms.msgs[nseq]; ok {
 			break
 		}
@@ -390,6 +395,7 @@ func (ms *memStore) updateFirstSeq(seq uint64) {
 		// Like purge.
 		ms.state.FirstSeq = ms.state.LastSeq + 1
 		ms.state.FirstTime = time.Time{}
+		ms.dmap = make(map[uint64]struct{})
 	}
 }
 
@@ -435,7 +441,16 @@ func (ms *memStore) State() StreamState {
 	ms.mu.RLock()
 	state := ms.state
 	state.Consumers = ms.consumers
+	state.Deleted = nil
+	for seq := range ms.dmap {
+		state.Deleted = append(state.Deleted, seq)
+	}
 	ms.mu.RUnlock()
+	if len(state.Deleted) > 0 {
+		sort.Slice(state.Deleted, func(i, j int) bool {
+			return state.Deleted[i] < state.Deleted[j]
+		})
+	}
 	return state
 }
 

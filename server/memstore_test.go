@@ -16,6 +16,7 @@ package server
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -298,5 +299,49 @@ func TestMemStoreMsgHeaders(t *testing.T) {
 	}
 	if removed, _ := ms.EraseMsg(1); !removed {
 		t.Fatalf("Expected erase msg to return success")
+	}
+}
+
+func TestMemStoreStreamStateDeleted(t *testing.T) {
+	ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error creating store: %v", err)
+	}
+
+	subj, toStore := "foo", uint64(10)
+	for i := uint64(1); i <= toStore; i++ {
+		msg := []byte(fmt.Sprintf("[%08d] Hello World!", i))
+		if _, _, err := ms.StoreMsg(subj, nil, msg); err != nil {
+			t.Fatalf("Error storing msg: %v", err)
+		}
+	}
+	state := ms.State()
+	if len(state.Deleted) != 0 {
+		t.Fatalf("Expected deleted to be empty")
+	}
+	// Now remove some interior messages.
+	var expected []uint64
+	for seq := uint64(2); seq < toStore; seq += 2 {
+		ms.RemoveMsg(seq)
+		expected = append(expected, seq)
+	}
+	state = ms.State()
+	if !reflect.DeepEqual(state.Deleted, expected) {
+		t.Fatalf("Expected deleted to be %+v, got %+v\n", expected, state.Deleted)
+	}
+	// Now fill the gap by deleting 1 and 3
+	ms.RemoveMsg(1)
+	ms.RemoveMsg(3)
+	expected = expected[2:]
+	state = ms.State()
+	if !reflect.DeepEqual(state.Deleted, expected) {
+		t.Fatalf("Expected deleted to be %+v, got %+v\n", expected, state.Deleted)
+	}
+	if state.FirstSeq != 5 {
+		t.Fatalf("Expected first seq to be 5, got %d", state.FirstSeq)
+	}
+	ms.Purge()
+	if state = ms.State(); len(state.Deleted) != 0 {
+		t.Fatalf("Expected no deleted after purge, got %+v\n", state.Deleted)
 	}
 }

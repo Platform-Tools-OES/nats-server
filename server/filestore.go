@@ -2184,7 +2184,26 @@ func (fs *fileStore) State() StreamState {
 	fs.mu.RLock()
 	state := fs.state
 	state.Consumers = len(fs.cfs)
+	state.Deleted = nil // make sure.
+	for _, mb := range fs.blks {
+		mb.mu.Lock()
+		fseq := mb.first.seq
+		for seq := range mb.dmap {
+			if seq <= fseq {
+				delete(mb.dmap, seq)
+			} else {
+				state.Deleted = append(state.Deleted, seq)
+			}
+		}
+		mb.mu.Unlock()
+	}
 	fs.mu.RUnlock()
+	// Can not be guaranteed to be sorted.
+	if len(state.Deleted) > 0 {
+		sort.Slice(state.Deleted, func(i, j int) bool {
+			return state.Deleted[i] < state.Deleted[j]
+		})
+	}
 	return state
 }
 

@@ -827,7 +827,7 @@ func TestFileStoreRemovePartialRecovery(t *testing.T) {
 	defer fs.Stop()
 
 	state2 := fs.State()
-	if state != state2 {
+	if !reflect.DeepEqual(state2, state) {
 		t.Fatalf("Expected recovered state to be the same, got %+v vs %+v\n", state2, state)
 	}
 }
@@ -884,7 +884,7 @@ func TestFileStoreRemoveOutOfOrderRecovery(t *testing.T) {
 	defer fs.Stop()
 
 	state2 := fs.State()
-	if state != state2 {
+	if !reflect.DeepEqual(state2, state) {
 		t.Fatalf("Expected recovered states to be the same, got %+v vs %+v\n", state, state2)
 	}
 
@@ -1601,7 +1601,7 @@ func TestFileStoreSnapshot(t *testing.T) {
 		// FIXME(dlc) - Also the hashes will not match if directory is not the same, so need to
 		// work through that problem too. The test below will pass but if you try to extract a
 		// message that will most likely fail.
-		if rstate != state {
+		if !reflect.DeepEqual(rstate, state) {
 			t.Fatalf("Restored state does not match, %+v vs %+v", rstate, state)
 		}
 	}
@@ -2348,6 +2348,55 @@ func TestFileStoreConsumerDeliveredAndAckUpdates(t *testing.T) {
 	}
 	if !reflect.DeepEqual(nstate, state) {
 		t.Fatalf("States don't match!")
+	}
+}
+
+func TestFileStoreStreamStateDeleted(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	subj, toStore := "foo", uint64(10)
+	for i := uint64(1); i <= toStore; i++ {
+		msg := []byte(fmt.Sprintf("[%08d] Hello World!", i))
+		if _, _, err := fs.StoreMsg(subj, nil, msg); err != nil {
+			t.Fatalf("Error storing msg: %v", err)
+		}
+	}
+	state := fs.State()
+	if len(state.Deleted) != 0 {
+		t.Fatalf("Expected deleted to be empty")
+	}
+	// Now remove some interior messages.
+	var expected []uint64
+	for seq := uint64(2); seq < toStore; seq += 2 {
+		fs.RemoveMsg(seq)
+		expected = append(expected, seq)
+	}
+	state = fs.State()
+	if !reflect.DeepEqual(state.Deleted, expected) {
+		t.Fatalf("Expected deleted to be %+v, got %+v\n", expected, state.Deleted)
+	}
+	// Now fill the gap by deleting 1 and 3
+	fs.RemoveMsg(1)
+	fs.RemoveMsg(3)
+	expected = expected[2:]
+	state = fs.State()
+	if !reflect.DeepEqual(state.Deleted, expected) {
+		t.Fatalf("Expected deleted to be %+v, got %+v\n", expected, state.Deleted)
+	}
+	if state.FirstSeq != 5 {
+		t.Fatalf("Expected first seq to be 5, got %d", state.FirstSeq)
+	}
+	fs.Purge()
+	if state = fs.State(); len(state.Deleted) != 0 {
+		t.Fatalf("Expected no deleted after purge, got %+v\n", state.Deleted)
 	}
 }
 
