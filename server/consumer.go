@@ -595,7 +595,7 @@ func (o *Consumer) setLeader(isLeader bool) {
 	// If we are here we have a change in leader status.
 	if isLeader {
 		if isRunning {
-			fmt.Printf("[%s] - Consumer setLeader(true) but was already up and running!\n", o.acc.srv.Name())
+			fmt.Printf("[%s] - Consumer setLeader(true) but was already up and running!\n", o.acc.srv)
 			return
 		}
 
@@ -981,6 +981,7 @@ func (o *Consumer) updateDelivered(dseq, sseq, dc uint64, ts int64) {
 		n += binary.PutUvarint(b[n:], sseq)
 		n += binary.PutUvarint(b[n:], dc)
 		n += binary.PutVarint(b[n:], ts)
+		fmt.Printf("\n\n[%s] - Consumer updateDelivered: %d %d %d %d - %d!\n\n", o.acc.srv, dseq, sseq, dc, ts, n)
 		o.node.Propose(b[:n])
 	} else {
 		o.store.UpdateDelivered(dseq, sseq, dc, ts)

@@ -216,11 +216,10 @@ func (s *Server) startRaftNode(cfg *RaftConfig) (RaftNode, error) {
 
 	if state := n.wal.State(); state.Msgs > 0 {
 		// TODO(dlc) - Recover our state here.
-		if last, err := n.loadLastEntry(); err == nil {
+		if first, err := n.loadFirstEntry(); err == nil {
 			n.debug("Recovered %+v\n", state)
-			n.debug("Loaded last ae from index %d: %+v\n", state.LastSeq, last)
-			//n.pterm = last.term
-			//n.pindex = state.LastSeq
+			n.debug("Loaded first ae from index %d: %+v\n", state.FirstSeq, first)
+			n.pterm, n.pindex = first.pterm, first.pindex
 		}
 		// Replay the log.
 		// Since doing this in place we need to make sure we have enough room on the applyc.
@@ -234,7 +233,6 @@ func (s *Server) startRaftNode(cfg *RaftConfig) (RaftNode, error) {
 				n.debug("Could not load WAL entry %d on startup!\n")
 				panic("err loading index")
 			}
-			n.debug("Processing %d on startup\n", index)
 			n.processAppendEntry(ae, nil)
 		}
 	}
@@ -248,7 +246,10 @@ func (s *Server) startRaftNode(cfg *RaftConfig) (RaftNode, error) {
 	n.trackPeer(n.id)
 	// Track known peers
 	for _, peer := range ps.knownPeers {
-		n.trackPeer(peer)
+		// Set these to 0 to start.
+		if peer != n.id {
+			n.peers[peer] = 0
+		}
 	}
 
 	s.registerRaftNode(n.group, n)
@@ -313,7 +314,7 @@ func (n *raft) Propose(data []byte) error {
 	propc := n.propc
 	n.RUnlock()
 
-	n.debug("PROPOSE CALLED\n")
+	n.debug("PROPOSE CALLED %q\n", data)
 
 	select {
 	case propc <- &Entry{EntryNormal, data}:
@@ -352,7 +353,7 @@ func (n *raft) ProposeRemovePeer(peer string) error {
 func (n *raft) Applied(index uint64) {
 	n.Lock()
 	// FIXME(dlc) - Check spec on error conditions, storage
-	n.debug("Updating applied to %d!\n", index)
+	n.debug("Updating Applied to %d!\n", index)
 	n.applied = index
 	// FIXME(dlc) - Can be more efficient here.
 	if ae, err := n.loadEntry(index); ae != nil && err == nil {
@@ -408,18 +409,29 @@ func (n *raft) Current() bool {
 		return false
 	}
 	n.RLock()
-	isCurrent := n.state == Leader
-	if !isCurrent && n.catchup == nil {
+	defer n.RUnlock()
+
+	n.debug("Current called with commit %d and applied %d\n", n.commit, n.applied)
+	// First check if we match commit and applied.
+	if n.commit != n.applied {
+		return false
+	}
+	// Make sure we are the leader or we know we have heard from the leader recently.
+	if n.state == Leader {
+		return true
+	}
+	// Check to see that we have heard from the current leader lately.
+	if n.leader != noLeader {
 		const okInterval = int64(hbInterval) * 2
-		// We are not in a catchup state, check last time we heard from the leader.
-		// If within a hbInterval*2 consider us good.
 		ts := time.Now().UnixNano()
+		n.debug("Checking if the leader [%s] is up to date! %v last\n", n.leader, time.Duration(ts-n.peers[n.leader]))
 		if lts := n.peers[n.leader]; lts > 0 && (ts-lts) <= okInterval {
-			isCurrent = true
+			n.debug("Leader seems up to date\n")
+			return true
 		}
 	}
-	n.RUnlock()
-	return isCurrent
+	n.debug("We are not up to date\n")
+	return false
 }
 
 // GroupLeader returns the current leader of the group.
@@ -441,7 +453,7 @@ func (n *raft) StepDown() error {
 		return errNotLeader
 	}
 
-	n.debug("Being asked to setpdown!\n")
+	n.debug("Being asked to stepdown!\n")
 	// See if we have up to date followers.
 	nowts := time.Now().UnixNano()
 	maybeLeader := noLeader
@@ -636,7 +648,7 @@ func (n *raft) runAsFollower() {
 				return
 			}
 		case newLeader := <-n.stepdown:
-			n.debug("Got an new leader as a follower! %v\n")
+			n.debug("Got a new leader as a follower! %v\n", newLeader)
 			n.switchToFollower(newLeader)
 			return
 		}
@@ -679,7 +691,7 @@ type Entry struct {
 
 func (ae *appendEntry) String() string {
 	return fmt.Sprintf("&{leader:%s term:%d commit:%d pterm:%d pindex:%d entries: %d}",
-		ae.leader, ae.term, ae.term, ae.pterm, ae.pindex, len(ae.entries))
+		ae.leader, ae.term, ae.commit, ae.pterm, ae.pindex, len(ae.entries))
 }
 
 const appendEntryBaseLen = idLen + 4*8 + 2
@@ -729,8 +741,7 @@ func (n *raft) decodeAppendEntry(msg []byte, reply string) *appendEntry {
 		le := int(le.Uint32(msg[ri:]))
 		ri += 4
 		etype := EntryType(msg[ri])
-		ri++
-		ae.entries = append(ae.entries, &Entry{etype, msg[ri : ri+le-1]})
+		ae.entries = append(ae.entries, &Entry{etype, msg[ri+1 : ri+le]})
 		ri += int(le)
 	}
 	ae.reply = reply
@@ -783,8 +794,6 @@ func (n *raft) decodeAppendEntryResponse(msg []byte) *appendEntryResponse {
 
 func (n *raft) runAsLeader() {
 	n.debug("LEADER!\n")
-	n.debug("Commit is %d\n", n.commit)
-
 	n.sendPeerState()
 
 	const hbInterval = 250 * time.Millisecond
@@ -800,12 +809,13 @@ func (n *raft) runAsLeader() {
 		case b := <-n.propc:
 			entries := []*Entry{b}
 			if b.Type == EntryNormal {
+				const maxBatch = 512 * 1024
 			gather:
-				// Gather more if available, limit to 3 atm. TODO(dlc)
-				for x := 0; x < 3; x++ {
+				for sz := 0; sz < maxBatch; {
 					select {
 					case e := <-n.propc:
 						entries = append(entries, e)
+						sz += len(e.Data) + 1
 					default:
 						break gather
 					}
@@ -827,7 +837,6 @@ func (n *raft) runAsLeader() {
 				return
 			}
 		case newLeader := <-n.stepdown:
-			n.debug("Received an entry from another leader!\n")
 			n.switchToFollower(newLeader)
 			return
 		case ar := <-n.resp:
@@ -978,9 +987,10 @@ func (n *raft) loadEntry(index uint64) (*appendEntry, error) {
 	return n.decodeAppendEntry(msg, _EMPTY_), nil
 }
 
-// Apply will update our commit index and apply the entry to the apply chan.
+// applyCommit will update our commit index and apply the entry to the apply chan.
 // lock should be held.
-func (n *raft) apply(index uint64) {
+func (n *raft) applyCommit(index uint64) {
+	n.debug("applyCommit called for %d\n", index)
 	n.commit = index
 	if n.state == Leader {
 		delete(n.acks, index)
@@ -1020,10 +1030,13 @@ func (n *raft) apply(index uint64) {
 			writePeerState(n.sd, &peerState{n.peerNames(), n.csz})
 		}
 	}
-	// Pass to the upper layers if we normal entries.
+	// Pass to the upper layers if we have normal entries.
 	if len(committed) > 0 {
 		// We will block here placing the commit entry on purpose.
 		n.applyc <- &CommittedEntry{index, committed}
+	} else {
+		// If we processed inline update our applied index.
+		n.applied = index
 	}
 }
 
@@ -1034,7 +1047,7 @@ func (n *raft) trackResponse(ar *appendEntryResponse) {
 	// If we are tracking this peer as a catchup follower, update that here.
 	if indexUpdateC := n.progress[ar.peer]; indexUpdateC != nil {
 		n.debug("Trackresponse needs to update our catchup follower!\n")
-		indexUpdateC <- ar.index + 1
+		indexUpdateC <- ar.index
 	}
 
 	// Ignore items already comitted.
@@ -1045,19 +1058,14 @@ func (n *raft) trackResponse(ar *appendEntryResponse) {
 
 	// See if we have items to apply.
 	var sendHB bool
+
 	if results := n.acks[ar.index]; results != nil {
 		results[ar.peer] = struct{}{}
 		if nr := len(results); nr >= n.qn {
 			// We have a quorum.
-			// FIXME(dlc) - Make sure this is next in line.
-			n.debug("We have consensus on %d, commit is %d!!\n", ar.index, n.commit)
-			if ar.index == n.commit+1 {
-				n.debug("Applying %d\n", ar.index)
-				n.apply(ar.index)
-				sendHB = len(n.propc) == 0
-			} else {
-				n.debug("\n\n############## CONSENSUS BUT CAN'T COMMIT!\n\n")
-			}
+			n.debug("We have consensus on %d, current commit is %d!!\n", ar.index, n.commit)
+			n.applyCommit(ar.index)
+			sendHB = len(n.propc) == 0
 		}
 	}
 	n.Unlock()
@@ -1081,8 +1089,6 @@ func (n *raft) trackPeer(peer string) error {
 				n.debug("Leader detected a new peer! %q\n", peer)
 				return errUnknownPeer
 			}
-			n.debug("Adding new peer!! %q\n", peer)
-			n.debug("csz is %d, peers is %+v\n", n.csz, n.peers)
 			needPeerUpdate = true
 		}
 	}
@@ -1151,11 +1157,19 @@ func (n *raft) handleAppendEntry(sub *subscription, c *client, subject, reply st
 // processAppendEntry will process an appendEntry.
 func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 	n.Lock()
+	// Just return if closed.
+	if n.state == Closed {
+		n.debug("We are closed, returning from processAppendEntry\n")
+		n.Unlock()
+		return
+	}
 
-	isOriginal := sub != nil
+	// Is this a new ae or a replay on startup?
+	isNew := sub != nil
 
 	// Track leader directly
-	if isOriginal && ae.leader != noLeader {
+	if isNew && ae.leader != noLeader {
+		//n.debug("Track leader [%s] directly from processAppendEntry\n", ae.leader)
 		n.peers[ae.leader] = time.Now().UnixNano()
 	}
 
@@ -1188,14 +1202,10 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 		}
 	}
 
-	// More generic processing here.
-	ar := appendEntryResponse{n.pterm, n.pindex, n.id, false, _EMPTY_}
-
 	// Ignore old terms.
 	if ae.term < n.term {
 		n.Unlock()
 		n.debug("Ignoring old term!")
-		n.sendRPC(ae.reply, _EMPTY_, ar.encode())
 		return
 	}
 
@@ -1218,6 +1228,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 			// FIXME(dlc) - Check for stalls when leader stops etc.
 		} else {
 			// Check if we are catching up and this is a snapshot, if so reset our wal's index.
+			// Snapshots will always be by themselves.
 			if catchingUp && len(ae.entries) > 0 && ae.entries[0].Type == EntrySnapshot {
 				n.debug("Should reset index for wal to %d\n", ae.pindex+1)
 				n.debug("Old wal state is %+v\n", n.wal.State())
@@ -1236,6 +1247,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 					n.debug("Error subscribing to our inbox for catchup! %v\n", err)
 					return
 				}
+				ar := appendEntryResponse{n.pterm, n.pindex, n.id, false, _EMPTY_}
 				n.Unlock()
 				n.sendRPC(ae.reply, inbox, ar.encode())
 				return
@@ -1248,12 +1260,13 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 		n.debug("Cancelling catchup subscription since we are now up to date\n")
 		n.s.sysUnsubscribe(n.catchup)
 		n.catchup = nil
+		catchingUp = false
 	}
 
 	// Save to our WAL if we have entries.
 	if len(ae.entries) > 0 {
 		// Only store if an original which will have sub != nil
-		if isOriginal {
+		if isNew {
 			if err := n.storeToWAL(ae); err != nil {
 				n.debug("Error storing to WAL: %v\n", err)
 				if err == ErrStoreClosed {
@@ -1264,11 +1277,12 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 			}
 		} else {
 			// This is a replay on startup so just take the appendEntry version.
+			n.debug("Think this is a replay, setting n.pindex to %d\n", ae.pindex+1)
 			n.pterm = ae.term
 			n.pindex = ae.pindex + 1
 		}
 
-		// Check to see if we have any peer related entries to process here.
+		// Check to see if we have any related entries to process here.
 		for _, e := range ae.entries {
 			switch e.Type {
 			case EntryLeaderTransfer:
@@ -1280,8 +1294,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 				// These will not have commits follow them. We also know this will be by itself.
 				n.commit = ae.pindex + 1
 			case EntryAddPeer:
-				newPeer := string(e.Data)
-				if len(newPeer) == idLen {
+				if newPeer := string(e.Data); len(newPeer) == idLen {
 					// Track directly
 					n.peers[newPeer] = time.Now().UnixNano()
 				} else {
@@ -1294,14 +1307,14 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 	// Apply anything we need here.
 	if ae.commit > n.commit {
 		for index := n.commit + 1; index <= ae.commit; index++ {
-			n.debug("Apply commit for %d\n", index)
-			n.apply(index)
+			n.applyCommit(index)
 		}
 	}
+
+	ar := appendEntryResponse{n.pterm, n.pindex, n.id, true, _EMPTY_}
 	n.Unlock()
 
 	// Success. Send our response.
-	ar.success = true
 	n.sendRPC(ae.reply, _EMPTY_, ar.encode())
 }
 
@@ -1310,9 +1323,8 @@ func (n *raft) processPeerState(ps *peerState) {
 	// Update our version of peers to that of the leader.
 	n.csz = ps.clusterSize
 	n.peers = make(map[string]int64)
-	ts := time.Now().UnixNano()
 	for _, peer := range ps.knownPeers {
-		n.peers[peer] = ts
+		n.peers[peer] = 0
 	}
 	n.debug("Update peers from leader to %+v\n", n.peers)
 	writePeerState(n.sd, ps)
@@ -1344,7 +1356,7 @@ func (n *raft) storeToWAL(ae *appendEntry) error {
 	if err != nil {
 		return err
 	}
-	n.debug("StoreToWAL called, term %d index %d - %q\n", n.term, seq, ae.buf[:32])
+	//n.debug("StoreToWAL called, term %d index %d - %q\n", n.term, seq, ae.buf[47:])
 	n.debug("WAL state is %+v\n", n.wal.State())
 	n.pterm = ae.term
 	n.pindex = seq
@@ -1421,7 +1433,7 @@ func (n *raft) currentPeerState() *peerState {
 
 // sendPeerState will send our current peer state to the cluster.
 func (n *raft) sendPeerState() {
-	n.debug("SEND PEER STATE!\n")
+	n.debug("SEND PEER STATE! %+v\n", n.currentPeerState())
 	n.sendAppendEntry([]*Entry{&Entry{EntryPeerState, encodePeerState(n.currentPeerState())}})
 }
 

@@ -237,6 +237,28 @@ func (cc *jetStreamCluster) isCurrent() bool {
 	return cc.meta.Current()
 }
 
+// isStreamCurrent will determine if this node is a participant for the stream and if its up to date.
+// Read lock should be held.
+func (cc *jetStreamCluster) isStreamCurrent(account, stream string) bool {
+	if cc == nil {
+		// Non-clustered mode
+		return true
+	}
+	as := cc.streams[account]
+	if as == nil {
+		return false
+	}
+	sa := as[stream]
+	if sa == nil {
+		return false
+	}
+	rg := sa.Group
+	if rg == nil || rg.node == nil {
+		return false
+	}
+	return rg.node.Current()
+}
+
 func (a *Account) getJetStreamFromAccount() (*Server, *jetStream, *jsAccount) {
 	a.mu.RLock()
 	jsa := a.js
@@ -285,6 +307,14 @@ func (a *Account) JetStreamIsStreamLeader(stream string) bool {
 	js.mu.RLock()
 	defer js.mu.RUnlock()
 	return js.cluster.isStreamLeader(a.Name, stream)
+}
+
+func (s *Server) JetStreamIsStreamCurrent(account, stream string) bool {
+	js, cc := s.getJetStreamCluster()
+	if js == nil {
+		return false
+	}
+	return cc.isStreamCurrent(account, stream)
 }
 
 func (a *Account) JetStreamIsConsumerLeader(stream, consumer string) bool {
@@ -1207,15 +1237,15 @@ func (js *jetStream) processClusterCreateConsumer(ca *consumerAssignment) {
 
 	fmt.Printf("\n**Adding in consumer with rg %+v\n", rg)
 
+	// Process the raft group and make sure its running if needed.
+	js.createRaftGroup(rg)
+
 	// Add in the consumer.
 	o, err := mset.addConsumer(ca.Config, ca.Name, rg.node)
 	if err != nil {
 		fmt.Printf("\n**ERROR in consumer: %v\n", err)
 		ca.err = err
 	}
-
-	// Process the raft group and make sure its running if needed.
-	js.createRaftGroup(rg)
 
 	// Start our monitoring routine.
 	if rg.node != nil {
@@ -1327,7 +1357,7 @@ func (js *jetStream) monitorConsumerRaftGroup(o *Consumer, ca *consumerAssignmen
 	s, n := js.server(), o.raftNode()
 	if n == nil {
 		s.Warnf("JetStream cluster can't monitor consumer raft group, account %q, consumer %q", o.acc.Name, o.name)
-		fmt.Printf("JetStream cluster can't monitor consumer raft group, account %q, consumer %q\n\n", o.acc.Name, o.name)
+		fmt.Printf("[%s:%s] JetStream cluster can't monitor consumer raft group, account %q, consumer %q\n\n", js.srv, ca.Group.Name, o.acc.Name, o.name)
 		return
 	}
 	qch, lch, ach := n.QuitC(), n.LeadChangeC(), n.ApplyC()

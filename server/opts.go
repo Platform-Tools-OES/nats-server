@@ -67,7 +67,7 @@ type ClusterOpts struct {
 	TLSTimeout        float64           `json:"-"`
 	TLSConfig         *tls.Config       `json:"-"`
 	TLSMap            bool              `json:"-"`
-	TLSCheckKnwonURLs bool              `json:"-"`
+	TLSCheckKnownURLs bool              `json:"-"`
 	ListenStr         string            `json:"-"`
 	Advertise         string            `json:"-"`
 	NoAdvertise       bool              `json:"-"`
@@ -1212,7 +1212,7 @@ func parseCluster(v interface{}, opts *Options, errors *[]error, warnings *[]err
 			opts.Cluster.TLSConfig = config
 			opts.Cluster.TLSTimeout = tlsopts.Timeout
 			opts.Cluster.TLSMap = tlsopts.Map
-			opts.Cluster.TLSCheckKnwonURLs = tlsopts.TLSCheckKnownURLs
+			opts.Cluster.TLSCheckKnownURLs = tlsopts.TLSCheckKnownURLs
 		case "cluster_advertise", "advertise":
 			opts.Cluster.Advertise = mv.(string)
 		case "no_advertise":

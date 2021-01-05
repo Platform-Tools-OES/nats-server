@@ -73,9 +73,9 @@ func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers
 
 	// Wait til we are formed and have a leader.
 	c.checkClusterFormed()
+	fmt.Printf("\n\nCLUSTER FORMED!\n\n")
 	c.waitOnClusterReady()
-
-	fmt.Printf("\n\nCLUSTER FORMED AND READY!\n\n")
+	fmt.Printf("\n\nCLUSTER READY!\n\n")
 
 	return c
 }
@@ -138,7 +138,7 @@ func TestJetStreamClusterLeader(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
 	defer c.shutdown()
 
-	// Kill our current leader and force and election.
+	// Kill our current leader and force an election.
 	c.leader().Shutdown()
 	c.waitOnClusterReady()
 
@@ -148,14 +148,14 @@ func TestJetStreamClusterLeader(t *testing.T) {
 }
 
 func TestJetStreamExpandCluster(t *testing.T) {
-	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	c := createJetStreamClusterExplicit(t, "JSC", 2)
 	defer c.shutdown()
 
 	fmt.Printf("\nEXPANDING THE CLUSTER\n\n")
 	c.addInNewServer()
 
 	fmt.Printf("\nDONE EXPANDING THE CLUSTER\n\n")
-	c.waitOnPeerCount(4)
+	c.waitOnPeerCount(3)
 	fmt.Printf("\nDONE WAITING ON EXPANDING THE CLUSTER\n\n")
 }
 
@@ -312,7 +312,7 @@ func TestJetStreamClusterMultiReplicaStreams(t *testing.T) {
 	}
 	fmt.Printf("si is %+v\n", si)
 
-	fmt.Printf("\nSENDING MSG!!\n\n")
+	fmt.Printf("\nSENDING MSGS!!\n\n")
 
 	start := time.Now()
 
@@ -320,14 +320,13 @@ func TestJetStreamClusterMultiReplicaStreams(t *testing.T) {
 	msg, toSend := []byte("Hello JS Clustering"), 10
 	for i := 0; i < toSend; i++ {
 		ts := time.Now()
-		if _, err := nc.Request("foo", msg, time.Second); err != nil {
-			//if _, err = js.Publish("foo", msg); err != nil {
+		if _, err = js.Publish("foo", msg); err != nil {
 			t.Fatalf("Unexpected publish error: %v", err)
 		}
 		fmt.Printf("Took %v to send msg\n", time.Since(ts))
 	}
 
-	fmt.Printf("Took %v to send %d msgs with replica 2!\n\n", time.Since(start), toSend)
+	fmt.Printf("Took %v to send %d msgs with replica 3!\n\n", time.Since(start), toSend)
 
 	fmt.Printf("\nREQUESTING STREAM INFO\n\n")
 
@@ -431,8 +430,6 @@ func TestJetStreamClusterDelete(t *testing.T) {
 	if !cdResp.Success || cdResp.Error != nil {
 		t.Fatalf("Got a bad response %+v", cdResp)
 	}
-
-	time.Sleep(5 * time.Second)
 
 	// Now delete the stream.
 	resp, _ = nc.Request(fmt.Sprintf(server.JSApiStreamDeleteT, cfg.Name), nil, time.Second)
@@ -799,13 +796,19 @@ func TestJetStreamClusterStreamCatchup(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	toSend := 2
+	fmt.Printf("\n\nSENDING MSGS\n\n")
+	now := time.Now()
+
+	toSend := 10
 	for i := 1; i <= toSend; i++ {
 		msg := []byte(fmt.Sprintf("HELLO JSC-%d", i))
+
 		if _, err = js.Publish("foo", msg); err != nil {
 			t.Fatalf("Unexpected publish error: %v", err)
 		}
 	}
+
+	fmt.Printf("\n\n###### Took %v avg per send for %d msgs\n\n", time.Since(now)/time.Duration(toSend), toSend)
 
 	sl := c.streamLeader("$G", "TEST")
 
@@ -849,6 +852,9 @@ func TestJetStreamClusterStreamCatchup(t *testing.T) {
 	fmt.Printf("\n\nWAIT TO CATCHUP %v\n\n", sl)
 
 	c.waitOnServerCurrent(sl)
+	c.waitOnStreamCurrent(sl, "$G", "TEST")
+
+	fmt.Printf("\n\nCAUGHT UP! SHUTTING DOWN\n\n")
 }
 
 func (c *cluster) restartServer(rs *server.Server) *server.Server {
@@ -923,7 +929,7 @@ func (c *cluster) waitOnNewStreamLeader(account, stream string) {
 		if leader := c.streamLeader(account, stream); leader != nil {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	c.t.Fatalf("Expected a stream leader for %q %q, got none", account, stream)
 }
@@ -938,6 +944,18 @@ func (c *cluster) streamLeader(account, stream string) *server.Server {
 	return nil
 }
 
+func (c *cluster) waitOnStreamCurrent(s *server.Server, account, stream string) {
+	c.t.Helper()
+	expires := time.Now().Add(5 * time.Second)
+	for time.Now().Before(expires) {
+		if s.JetStreamIsStreamCurrent(account, stream) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	c.t.Fatalf("Expected server %q to eventually be current for stream %q", s, stream)
+}
+
 func (c *cluster) waitOnServerCurrent(s *server.Server) {
 	c.t.Helper()
 	expires := time.Now().Add(5 * time.Second)
@@ -945,7 +963,7 @@ func (c *cluster) waitOnServerCurrent(s *server.Server) {
 		if s.JetStreamIsCurrent() {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	c.t.Fatalf("Expected server %q to eventually be current", s)
 }

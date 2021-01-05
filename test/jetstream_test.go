@@ -4117,7 +4117,7 @@ func TestJetStreamSnapshots(t *testing.T) {
 	if nusage := acc.JetStreamUsage(); nusage != pusage {
 		t.Fatalf("Usage does not match after restore: %+v vs %+v", nusage, pusage)
 	}
-	if state := mset.State(); state != info.state {
+	if state := mset.State(); !reflect.DeepEqual(state, info.state) {
 		t.Fatalf("State does not match: %+v vs %+v", state, info.state)
 	}
 	if cfg := mset.Config(); !reflect.DeepEqual(cfg, info.cfg) {
@@ -4348,7 +4348,7 @@ func TestJetStreamSnapshotsAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expected to find a stream for %q", mname)
 	}
-	if mset.State() != state {
+	if !reflect.DeepEqual(mset.State(), state) {
 		t.Fatalf("Did not match states, %+v vs %+v", mset.State(), state)
 	}
 
@@ -4455,7 +4455,7 @@ func TestJetStreamSnapshotsAPI(t *testing.T) {
 		t.Fatalf("Got an unexpected error from EOF omn restore: %+v", scResp.Error)
 	}
 
-	if scResp.StreamInfo.State != state {
+	if !reflect.DeepEqual(scResp.StreamInfo.State, state) {
 		t.Fatalf("Did not match states, %+v vs %+v", scResp.StreamInfo.State, state)
 	}
 }
@@ -6936,7 +6936,7 @@ func TestJetStreamSimpleFileRecovery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Expected to find a stream for %q", mname)
 		}
-		if state := mset.State(); state != info.state {
+		if state := mset.State(); !reflect.DeepEqual(state, info.state) {
 			t.Fatalf("State does not match: %+v vs %+v", state, info.state)
 		}
 		if cfg := mset.Config(); !reflect.DeepEqual(cfg, info.cfg) {
@@ -8017,7 +8017,7 @@ func TestJetStreamDeleteMsg(t *testing.T) {
 
 				afterState := mset.State()
 				// Ignore first time in this test.
-				if afterState != expectedState {
+				if !reflect.DeepEqual(afterState, expectedState) {
 					t.Fatalf("Stats not what we expected. Expected %+v, got %+v\n", expectedState, afterState)
 				}
 			}
@@ -8065,7 +8065,8 @@ func TestJetStreamDeleteMsg(t *testing.T) {
 			expected := server.StreamState{Msgs: 6, Bytes: 6 * bytesPerMsg, FirstSeq: 12, LastSeq: 20}
 			state = mset.State()
 			state.FirstTime, state.LastTime = time.Time{}, time.Time{}
-			if state != expected {
+
+			if !reflect.DeepEqual(expected, state) {
 				t.Fatalf("State not what we expected. Expected %+v, got %+v\n", expected, state)
 			}
 
