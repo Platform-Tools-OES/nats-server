@@ -27,81 +27,6 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-var jsClusterTempl = `
-	listen: 127.0.0.1:-1
-	server_name: %s
-	jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: "%s"}
-	cluster {
-		name: %s
-		listen: 127.0.0.1:%d
-		routes = [%s]
-	}
-`
-
-// This will create a cluster that is explicitly configured for the routes, etc.
-// and also has a defined clustername. All configs for routes and cluster name will be the same.
-func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers int) *cluster {
-	t.Helper()
-	if clusterName == "" || numServers < 1 {
-		t.Fatalf("Bad params")
-	}
-	const startClusterPort = 22332
-
-	// Build out the routes that will be shared with all configs.
-	var routes []string
-	for cp := startClusterPort; cp < startClusterPort+numServers; cp++ {
-		routes = append(routes, fmt.Sprintf("nats-route://127.0.0.1:%d", cp))
-	}
-	routeConfig := strings.Join(routes, ",")
-
-	// Go ahead and build configurations and start servers.
-	c := &cluster{servers: make([]*server.Server, 0, numServers), opts: make([]*server.Options, 0, numServers), name: clusterName}
-
-	for cp := startClusterPort; cp < startClusterPort+numServers; cp++ {
-		storeDir, _ := ioutil.TempDir("", server.JetStreamStoreDir)
-		sn := fmt.Sprintf("S-%d", cp-startClusterPort+1)
-		conf := fmt.Sprintf(jsClusterTempl, sn, storeDir, clusterName, cp, routeConfig)
-		s, o := RunServerWithConfig(createConfFile(t, []byte(conf)))
-		if doLog {
-			pre := fmt.Sprintf("[S-%d] - ", cp-startClusterPort+1)
-			s.SetLogger(logger.NewTestLogger(pre, true), true, true)
-		}
-		c.servers = append(c.servers, s)
-		c.opts = append(c.opts, o)
-	}
-	c.t = t
-
-	// Wait til we are formed and have a leader.
-	c.checkClusterFormed()
-	fmt.Printf("\n\nCLUSTER FORMED!\n\n")
-	c.waitOnClusterReady()
-	fmt.Printf("\n\nCLUSTER READY!\n\n")
-
-	return c
-}
-
-func (c *cluster) addInNewServer() *server.Server {
-	c.t.Helper()
-	sn := fmt.Sprintf("S-%d", len(c.servers)+1)
-	storeDir, _ := ioutil.TempDir("", server.JetStreamStoreDir)
-	seedRoute := fmt.Sprintf("nats-route://127.0.0.1:%d", c.opts[0].Cluster.Port)
-	conf := fmt.Sprintf(jsClusterTempl, sn, storeDir, c.name, -1, seedRoute)
-	s, o := RunServerWithConfig(createConfFile(c.t, []byte(conf)))
-	if doLog {
-		pre := fmt.Sprintf("[%s] - ", sn)
-		s.SetLogger(logger.NewTestLogger(pre, true), true, true)
-	}
-	c.servers = append(c.servers, s)
-	c.opts = append(c.opts, o)
-	c.checkClusterFormed()
-	return s
-}
-
-// Hack for staticcheck
-var skip = func(t *testing.T) {
-	t.SkipNow()
-}
-
 func TestJetStreamClusterConfig(t *testing.T) {
 	conf := createConfFile(t, []byte(`
 		listen: 127.0.0.1:-1
@@ -189,29 +114,6 @@ func TestJetStreamClusterAccountInfo(t *testing.T) {
 	if nmsgs, _, _ := sub.Pending(); nmsgs > 0 {
 		t.Fatalf("Expected only a single response, got %d more", nmsgs)
 	}
-}
-
-func jsClientConnect(t *testing.T, s *server.Server) (*nats.Conn, nats.JetStreamContext) {
-	t.Helper()
-	nc, err := nats.Connect(s.ClientURL())
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	js, err := nc.JetStream()
-	if err != nil {
-		t.Fatalf("Unexpected error getting JetStream context: %v", err)
-	}
-	return nc, js
-}
-
-func checkSubsPending(t *testing.T, sub *nats.Subscription, numExpected int) {
-	t.Helper()
-	checkFor(t, 200*time.Millisecond, 10*time.Millisecond, func() error {
-		if nmsgs, _, err := sub.Pending(); err != nil || nmsgs != numExpected {
-			return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, numExpected)
-		}
-		return nil
-	})
 }
 
 func TestJetStreamClusterSingleReplicaStreams(t *testing.T) {
@@ -993,6 +895,106 @@ func TestJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
 	c.waitOnStreamCurrent(sl, "$G", "TEST")
 
 	fmt.Printf("\n\nCAUGHT UP! SHUTTING DOWN\n\n")
+}
+
+// Support functions
+
+var jsClusterTempl = `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: "%s"}
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+`
+
+// This will create a cluster that is explicitly configured for the routes, etc.
+// and also has a defined clustername. All configs for routes and cluster name will be the same.
+func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers int) *cluster {
+	t.Helper()
+	if clusterName == "" || numServers < 1 {
+		t.Fatalf("Bad params")
+	}
+	const startClusterPort = 22332
+
+	// Build out the routes that will be shared with all configs.
+	var routes []string
+	for cp := startClusterPort; cp < startClusterPort+numServers; cp++ {
+		routes = append(routes, fmt.Sprintf("nats-route://127.0.0.1:%d", cp))
+	}
+	routeConfig := strings.Join(routes, ",")
+
+	// Go ahead and build configurations and start servers.
+	c := &cluster{servers: make([]*server.Server, 0, numServers), opts: make([]*server.Options, 0, numServers), name: clusterName}
+
+	for cp := startClusterPort; cp < startClusterPort+numServers; cp++ {
+		storeDir, _ := ioutil.TempDir("", server.JetStreamStoreDir)
+		sn := fmt.Sprintf("S-%d", cp-startClusterPort+1)
+		conf := fmt.Sprintf(jsClusterTempl, sn, storeDir, clusterName, cp, routeConfig)
+		s, o := RunServerWithConfig(createConfFile(t, []byte(conf)))
+		if doLog {
+			pre := fmt.Sprintf("[S-%d] - ", cp-startClusterPort+1)
+			s.SetLogger(logger.NewTestLogger(pre, true), true, true)
+		}
+		c.servers = append(c.servers, s)
+		c.opts = append(c.opts, o)
+	}
+	c.t = t
+
+	// Wait til we are formed and have a leader.
+	c.checkClusterFormed()
+	fmt.Printf("\n\nCLUSTER FORMED!\n\n")
+	c.waitOnClusterReady()
+	fmt.Printf("\n\nCLUSTER READY!\n\n")
+
+	return c
+}
+
+func (c *cluster) addInNewServer() *server.Server {
+	c.t.Helper()
+	sn := fmt.Sprintf("S-%d", len(c.servers)+1)
+	storeDir, _ := ioutil.TempDir("", server.JetStreamStoreDir)
+	seedRoute := fmt.Sprintf("nats-route://127.0.0.1:%d", c.opts[0].Cluster.Port)
+	conf := fmt.Sprintf(jsClusterTempl, sn, storeDir, c.name, -1, seedRoute)
+	s, o := RunServerWithConfig(createConfFile(c.t, []byte(conf)))
+	if doLog {
+		pre := fmt.Sprintf("[%s] - ", sn)
+		s.SetLogger(logger.NewTestLogger(pre, true), true, true)
+	}
+	c.servers = append(c.servers, s)
+	c.opts = append(c.opts, o)
+	c.checkClusterFormed()
+	return s
+}
+
+// Hack for staticcheck
+var skip = func(t *testing.T) {
+	t.SkipNow()
+}
+
+func jsClientConnect(t *testing.T, s *server.Server) (*nats.Conn, nats.JetStreamContext) {
+	t.Helper()
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("Unexpected error getting JetStream context: %v", err)
+	}
+	return nc, js
+}
+
+func checkSubsPending(t *testing.T, sub *nats.Subscription, numExpected int) {
+	t.Helper()
+	checkFor(t, 200*time.Millisecond, 10*time.Millisecond, func() error {
+		if nmsgs, _, err := sub.Pending(); err != nil || nmsgs != numExpected {
+			return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, numExpected)
+		}
+		return nil
+	})
 }
 
 func (c *cluster) restartServer(rs *server.Server) *server.Server {
