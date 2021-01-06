@@ -287,6 +287,10 @@ func (s *Server) lookupRaftNode(group string) RaftNode {
 }
 
 func (s *Server) shutdownRaftNodes() {
+	if s == nil {
+		return
+	}
+
 	var nodes []RaftNode
 	s.rnMu.RLock()
 	for _, n := range s.raftNodes {

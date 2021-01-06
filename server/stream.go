@@ -103,6 +103,7 @@ type Stream struct {
 	ddindex   int
 	ddtmr     *time.Timer
 	node      RaftNode
+	nlseq     uint64
 }
 
 // Headers for published messages.
@@ -1003,14 +1004,14 @@ func (mset *Stream) processInboundJetStreamMsg(_ *subscription, pc *client, subj
 	if isClustered {
 		mset.processClusteredInboundMsg(subject, reply, hdr, msg)
 	} else {
-		mset.processJetStreamMsg(subject, reply, hdr, msg, 0)
+		mset.processJetStreamMsg(subject, reply, hdr, msg, 0, 0)
 	}
 }
 
 var errLastSeqMismatch = errors.New("last sequence mismatch")
 
 // processJetStreamMsg is where we try to actually process the stream msg.
-func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64) error {
+func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64, ts int64) error {
 	mset.mu.Lock()
 	store := mset.store
 	c := mset.client
@@ -1102,7 +1103,6 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		response []byte
 		seq      uint64
 		err      error
-		ts       int64
 	)
 
 	// Check to see if we are over the max msg size.
@@ -1135,6 +1135,11 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		}
 	}
 
+	// Grab timestamp if not already set.
+	if ts == 0 {
+		ts = time.Now().UnixNano()
+	}
+
 	// Skip msg here.
 	if noInterest {
 		mset.lseq = store.SkipMsg()
@@ -1148,7 +1153,7 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		}
 		// If we have a msgId make sure to save.
 		if msgId != _EMPTY_ {
-			mset.storeMsgId(&ddentry{msgId, seq, time.Now().UnixNano()})
+			mset.storeMsgId(&ddentry{msgId, seq, ts})
 		}
 		return nil
 	}
@@ -1156,17 +1161,23 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 	// If here we will attempt to store the message.
 	// Assume this will succeed.
 	olseq, olmsgId := mset.lseq, mset.lmsgId
-	mset.lseq++
 	mset.lmsgId = msgId
+	mset.lseq++
+
+	// Set sequence if not set.
+	if seq == 0 {
+		seq = mset.lseq
+	}
 
 	// We hold the lock to this point to make sure nothing gets between us since we check for pre-conditions.
+	// Currently can not hold while calling store b/c we have inline storage update calls that may need the lock.
 	mset.mu.Unlock()
 
 	// Store actual msg.
-	seq, ts, err = store.StoreMsg(subject, hdr, msg)
+	err = store.StoreRawMsg(subject, hdr, msg, seq, ts)
 
 	// If we did not succeed put those values back.
-	if err != nil || seq == 0 {
+	if err != nil {
 		mset.mu.Lock()
 		mset.lseq = olseq
 		mset.lmsgId = olmsgId
@@ -1513,13 +1524,13 @@ func (mset *Stream) ackMsg(obs *Consumer, seq uint64) {
 
 // Snapshot creates a snapshot for the stream and possibly consumers.
 func (mset *Stream) Snapshot(deadline time.Duration, checkMsgs, includeConsumers bool) (*SnapshotResult, error) {
-	mset.mu.Lock()
+	mset.mu.RLock()
 	if mset.client == nil || mset.store == nil {
-		mset.mu.Unlock()
+		mset.mu.RUnlock()
 		return nil, fmt.Errorf("invalid stream")
 	}
 	store := mset.store
-	mset.mu.Unlock()
+	mset.mu.RUnlock()
 
 	return store.Snapshot(deadline, checkMsgs, includeConsumers)
 }

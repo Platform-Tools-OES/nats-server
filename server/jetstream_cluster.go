@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/rand"
 	"path"
+	"time"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nuid"
@@ -198,6 +199,39 @@ func (s *Server) JetStreamSnapshotMeta() error {
 	return cc.meta.Snapshot(js.metaSnapshot())
 }
 
+func (s *Server) JetStreamSnapshotStream(account, stream string) error {
+	js, cc := s.getJetStreamCluster()
+	if js == nil {
+		return ErrJetStreamNotEnabled
+	}
+	if cc == nil {
+		return ErrJetStreamNotClustered
+	}
+	// Grab account
+	acc, err := s.LookupAccount(account)
+	if err != nil {
+		return err
+	}
+	// Grab stream
+	mset, err := acc.LookupStream(stream)
+	if err != nil {
+		return err
+	}
+
+	mset.mu.RLock()
+	if !mset.node.Leader() {
+		mset.mu.RUnlock()
+		return ErrJetStreamNotLeader
+	}
+	state := mset.store.State()
+	b, _ := json.Marshal(state)
+	fmt.Printf("\n\n[%s] - Stream state encoded is '%s'\n\n", s, b)
+	mset.node.Snapshot(b)
+	mset.mu.RUnlock()
+
+	return nil
+}
+
 func (s *Server) JetStreamClusterPeers() []string {
 	js := s.getJetStream()
 	if js == nil {
@@ -314,6 +348,8 @@ func (s *Server) JetStreamIsStreamCurrent(account, stream string) bool {
 	if js == nil {
 		return false
 	}
+	js.mu.RLock()
+	defer js.mu.RUnlock()
 	return cc.isStreamCurrent(account, stream)
 }
 
@@ -855,13 +891,13 @@ func (js *jetStream) applyStreamEntries(mset *Stream, ce *CommittedEntry) {
 			buf := e.Data
 			switch entryOp(buf[0]) {
 			case streamMsgOp:
-				subject, reply, hdr, msg, lseq, err := decodeStreamMsg(buf[1:])
+				subject, reply, hdr, msg, lseq, ts, err := decodeStreamMsg(buf[1:])
 				if err != nil {
 					panic(err.Error())
 				}
 				fmt.Printf("[%s] DECODED %q %q %q %q\n\n", js.srv.Name(), subject, reply, hdr, msg)
 				// processJetStreamMsg will respond to the client below if we are the leader.
-				if err := mset.processJetStreamMsg(subject, reply, hdr, msg, lseq); err != nil {
+				if err := mset.processJetStreamMsg(subject, reply, hdr, msg, lseq, ts); err != nil {
 					if err == errLastSeqMismatch {
 						// TODO(dlc) - Should we care here if this is < LastSeq vs not?
 						fmt.Printf("[%s] Ignoring message with expected seq of %d\n", js.srv, lseq+1)
@@ -1807,55 +1843,56 @@ func decodeConsumerAssignment(buf []byte) (*consumerAssignment, error) {
 
 var errBadStreamMsg = errors.New("jetstream cluster bad replicated stream msg")
 
-func decodeStreamMsg(buf []byte) (subject, reply string, hdr, msg []byte, lseq uint64, err error) {
+func decodeStreamMsg(buf []byte) (subject, reply string, hdr, msg []byte, lseq uint64, ts int64, err error) {
 	var le = binary.LittleEndian
-	// FIXME(dlc) - Short buffer checks.
-	if len(buf) < 20 {
-		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
+	if len(buf) < 26 {
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, errBadStreamMsg
 	}
 	lseq = le.Uint64(buf)
+	buf = buf[8:]
+	ts = int64(le.Uint64(buf))
 	buf = buf[8:]
 	sl := int(le.Uint16(buf))
 	buf = buf[2:]
 	if len(buf) < sl {
-		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, errBadStreamMsg
 	}
 	subject = string(buf[:sl])
 	buf = buf[sl:]
 	if len(buf) < 2 {
-		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, errBadStreamMsg
 	}
 	rl := int(le.Uint16(buf))
 	buf = buf[2:]
 	if len(buf) < rl {
-		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, errBadStreamMsg
 	}
 	reply = string(buf[:rl])
 	buf = buf[rl:]
 	if len(buf) < 2 {
-		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, errBadStreamMsg
 	}
 	hl := int(le.Uint16(buf))
 	buf = buf[2:]
 	if len(buf) < hl {
-		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, errBadStreamMsg
 	}
 	hdr = buf[:hl]
 	buf = buf[hl:]
 	if len(buf) < 4 {
-		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, errBadStreamMsg
 	}
 	ml := int(le.Uint32(buf))
 	buf = buf[4:]
 	if len(buf) < ml {
-		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, errBadStreamMsg
 	}
 	msg = buf[:ml]
-	return subject, reply, hdr, msg, lseq, nil
+	return subject, reply, hdr, msg, lseq, ts, nil
 }
 
-func encodeStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64) []byte {
-	elen := 1 + 8 + len(subject) + len(reply) + len(hdr) + len(msg)
+func encodeStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64, ts int64) []byte {
+	elen := 1 + 8 + 8 + len(subject) + len(reply) + len(hdr) + len(msg)
 	elen += (2 + 2 + 2 + 4) // Encoded lengths, 4bytes
 	// TODO(dlc) - check sizes of subject, reply and hdr, make sure uint16 ok.
 	buf := make([]byte, elen)
@@ -1863,6 +1900,8 @@ func encodeStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64) []byte
 	var le = binary.LittleEndian
 	wi := 1
 	le.PutUint64(buf[wi:], lseq)
+	wi += 8
+	le.PutUint64(buf[wi:], uint64(ts))
 	wi += 8
 	le.PutUint16(buf[wi:], uint16(len(subject)))
 	wi += 2
@@ -1888,8 +1927,36 @@ func encodeStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64) []byte
 }
 
 // processClusteredMsg will propose the inbound message to the underlying raft group.
-func (mset *Stream) processClusteredInboundMsg(subject, reply string, hdr, msg []byte) {
-	mset.mu.RLock()
-	mset.node.Propose(encodeStreamMsg(subject, reply, hdr, msg, mset.lseq))
-	mset.mu.RUnlock()
+func (mset *Stream) processClusteredInboundMsg(subject, reply string, hdr, msg []byte) error {
+	mset.mu.Lock()
+
+	// For possible error response.
+	var response []byte
+	canRespond := !mset.config.NoAck && len(reply) > 0 && mset.isLeader()
+	sendq := mset.sendq
+
+	// We only use mset.nlseq for clustering and in case we run ahead of actual commits.
+	// Check if we need to set initial value here
+	if mset.nlseq < mset.lseq {
+		mset.nlseq = mset.lseq
+	}
+
+	err := mset.node.Propose(encodeStreamMsg(subject, reply, hdr, msg, mset.nlseq, time.Now().UnixNano()))
+	if err != nil {
+		if canRespond {
+			var resp = &JSPubAckResponse{PubAck: &PubAck{Stream: mset.config.Name}}
+			resp.Error = &ApiError{Code: 503, Description: err.Error()}
+			response, _ = json.Marshal(resp)
+		}
+	} else {
+		mset.nlseq++
+	}
+	mset.mu.Unlock()
+
+	// If we errored out respond here.
+	if err != nil && len(response) > 0 {
+		sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, response, nil, 0}
+	}
+
+	return err
 }

@@ -41,11 +41,9 @@ var (
 	ErrStoreMsgNotFound = errors.New("no message found")
 	// ErrStoreEOF is returned when message seq is greater than the last sequence.
 	ErrStoreEOF = errors.New("stream EOF")
-	// ErrMaxMsgs is returned when we have discard new as a policy and we reached
-	// the message limit.
+	// ErrMaxMsgs is returned when we have discard new as a policy and we reached the message limit.
 	ErrMaxMsgs = errors.New("maximum messages exceeded")
-	// ErrMaxBytes is returned when we have discard new as a policy and we reached
-	// the bytes limit.
+	// ErrMaxBytes is returned when we have discard new as a policy and we reached the bytes limit.
 	ErrMaxBytes = errors.New("maximum bytes exceeded")
 	// ErrStoreSnapshotInProgress is returned when RemoveMsg or EraseMsg is called
 	// while a snapshot is in progress.
@@ -56,6 +54,8 @@ var (
 	ErrStoreWrongType = errors.New("wrong storage type")
 	// ErrNoAckPolicy is returned when trying to update a consumer's acks with no ack policy.
 	ErrNoAckPolicy = errors.New("ack policy is none")
+	// ErrSequenceMismatch is returned when storing a raw message and the expected sequence is wrong.
+	ErrSequenceMismatch = errors.New("expected sequence does not match store")
 )
 
 // Used to call back into the upper layers to report on changes in storage resources.
@@ -63,9 +63,10 @@ var (
 type StorageUpdateHandler func(msgs, bytes int64, seq uint64, subj string)
 
 type StreamStore interface {
-	StoreMsg(subj string, hdr, msg []byte) (uint64, int64, error)
+	StoreMsg(subject string, hdr, msg []byte) (uint64, int64, error)
+	StoreRawMsg(subject string, hdr, msg []byte, seq uint64, ts int64) error
 	SkipMsg() uint64
-	LoadMsg(seq uint64) (subj string, hdr, msg []byte, ts int64, err error)
+	LoadMsg(seq uint64) (subject string, hdr, msg []byte, ts int64, err error)
 	RemoveMsg(seq uint64) (bool, error)
 	EraseMsg(seq uint64) (bool, error)
 	Purge() (uint64, error)

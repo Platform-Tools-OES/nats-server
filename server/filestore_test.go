@@ -16,7 +16,6 @@ package server
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +31,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/klauspost/compress/s2"
 )
 
 func TestFileStoreBasics(t *testing.T) {
@@ -1550,12 +1551,7 @@ func TestFileStoreSnapshot(t *testing.T) {
 	// We will compare the states for this vs the original one.
 	verifySnapshot := func(snap []byte) {
 		r := bytes.NewReader(snap)
-		gzr, err := gzip.NewReader(r)
-		if err != nil {
-			t.Fatalf("Error creating gzip reader: %v", err)
-		}
-		defer gzr.Close()
-		tr := tar.NewReader(gzr)
+		tr := tar.NewReader(s2.NewReader(r))
 
 		rstoreDir, _ := ioutil.TempDir("", JetStreamStoreDir)
 		defer os.RemoveAll(rstoreDir)

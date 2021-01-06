@@ -775,7 +775,67 @@ func TestJetStreamClusterMetaSnapshotsMultiChange(t *testing.T) {
 	fmt.Printf("\n\nSHUTTING DOWN\n\n")
 }
 
-func TestJetStreamClusterStreamCatchup(t *testing.T) {
+func TestJetStreamClusterStreamSynchedTimeStamps(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 5)
+	defer c.shutdown()
+
+	s := c.randomServer()
+
+	// Client based API
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	fmt.Printf("\n\nCREATING STREAM\n\n")
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "foo", Replicas: 3})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	fmt.Printf("\n\nSENDING MSG\n\n")
+
+	if _, err = js.Publish("foo", []byte("TSS")); err != nil {
+		t.Fatalf("Unexpected publish error: %v", err)
+	}
+
+	// Grab the message and timestamp from our current leader
+	sub, err := js.SubscribeSync("foo")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	m, err := sub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	meta, _ := m.MetaData()
+	fmt.Printf("\n\n**meta is %+v\n\n", meta)
+
+	sub.Unsubscribe()
+
+	sl := c.streamLeader("$G", "foo")
+
+	fmt.Printf("\n\nSHUTDOWN STREAM LEADER %v\n\n", sl)
+
+	sl.Shutdown()
+	c.waitOnNewStreamLeader("$G", "foo")
+
+	sub, err = js.SubscribeSync("foo")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	m, err = sub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	meta2, _ := m.MetaData()
+	fmt.Printf("\n\n**meta2 is %+v\n\n", meta)
+
+	if meta.Timestamp != meta2.Timestamp {
+		t.Fatalf("Expected same timestamps, got %v vs %v", meta.Timestamp, meta2.Timestamp)
+	}
+}
+
+func TestJetStreamClusterStreamNormalCatchup(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
 
@@ -843,6 +903,84 @@ func TestJetStreamClusterStreamCatchup(t *testing.T) {
 	if !delMsgResp.Success || delMsgResp.Error != nil {
 		t.Fatalf("Got a bad response %+v", delMsgResp.Error)
 	}
+
+	fmt.Printf("\n\nRESTART OLD STREAM LEADER %v\n\n", sl)
+
+	sl = c.restartServer(sl)
+	c.checkClusterFormed()
+
+	fmt.Printf("\n\nWAIT TO CATCHUP %v\n\n", sl)
+
+	c.waitOnServerCurrent(sl)
+	c.waitOnStreamCurrent(sl, "$G", "TEST")
+
+	fmt.Printf("\n\nCAUGHT UP! SHUTTING DOWN\n\n")
+}
+
+func TestJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	s := c.randomServer()
+
+	// Client based API
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	fmt.Printf("\n\nCREATING STREAM\n\n")
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	sl := c.streamLeader("$G", "TEST")
+
+	fmt.Printf("\n\nSHUTDOWN STREAM LEADER %v\n\n", sl)
+
+	sl.Shutdown()
+	c.waitOnNewStreamLeader("$G", "TEST")
+
+	fmt.Printf("\n\nSENDING MSGS\n\n")
+	now := time.Now()
+
+	toSend := 100
+	for i := 1; i <= toSend; i++ {
+		msg := []byte(fmt.Sprintf("HELLO JSC-%d", i))
+		if _, err = js.Publish("foo", msg); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	fmt.Printf("\n\n###### Took %v avg per send for %d msgs\n\n", time.Since(now)/time.Duration(toSend), toSend)
+
+	toDelete := uint64(toSend) / 2
+	fmt.Printf("\n\nDELETING MSG %v\n\n", toDelete)
+
+	// Delete the first from the second batch.
+	dreq := server.JSApiMsgDeleteRequest{Seq: toDelete}
+	dreqj, err := json.Marshal(dreq)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	resp, _ := nc.Request(fmt.Sprintf(server.JSApiMsgDeleteT, "TEST"), dreqj, time.Second)
+	var delMsgResp server.JSApiMsgDeleteResponse
+	if err = json.Unmarshal(resp.Data, &delMsgResp); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !delMsgResp.Success || delMsgResp.Error != nil {
+		t.Fatalf("Got a bad response %+v", delMsgResp.Error)
+	}
+
+	nsl := c.streamLeader("$G", "TEST")
+
+	fmt.Printf("\n\nSNAPSHOT STREAM LEADER %v\n\n", nsl)
+
+	nsl.JetStreamSnapshotStream("$G", "TEST")
 
 	fmt.Printf("\n\nRESTART OLD STREAM LEADER %v\n\n", sl)
 

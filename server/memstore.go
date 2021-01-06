@@ -80,30 +80,28 @@ func (ms *memStore) UpdateConfig(cfg *StreamConfig) error {
 	return nil
 }
 
-// Store stores a message.
-func (ms *memStore) StoreMsg(subj string, hdr, msg []byte) (uint64, int64, error) {
-	ms.mu.Lock()
-
+// Stores a raw message with expected sequence number and timestamp.
+// Lock should be held.
+func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts int64) error {
 	// Check if we are discarding new messages when we reach the limit.
 	if ms.cfg.Discard == DiscardNew {
 		if ms.cfg.MaxMsgs > 0 && ms.state.Msgs >= uint64(ms.cfg.MaxMsgs) {
-			ms.mu.Unlock()
-			return 0, 0, ErrMaxMsgs
+			return ErrMaxMsgs
 		}
 		if ms.cfg.MaxBytes > 0 && ms.state.Bytes+uint64(len(msg)) >= uint64(ms.cfg.MaxBytes) {
-			ms.mu.Unlock()
-			return 0, 0, ErrMaxBytes
+			return ErrMaxBytes
 		}
 	}
 
-	// Grab time.
-	now := time.Now()
-	ts := now.UnixNano()
+	if seq != ms.state.LastSeq+1 {
+		return ErrSequenceMismatch
+	}
 
-	seq := ms.state.LastSeq + 1
+	// Adjust first if needed.
+	now := time.Unix(0, ts).UTC()
 	if ms.state.Msgs == 0 {
 		ms.state.FirstSeq = seq
-		ms.state.FirstTime = now.UTC()
+		ms.state.FirstTime = now
 	}
 
 	// Make copies - https://github.com/go101/go101/wiki
@@ -115,12 +113,11 @@ func (ms *memStore) StoreMsg(subj string, hdr, msg []byte) (uint64, int64, error
 		hdr = append(hdr[:0:0], hdr...)
 	}
 
-	startBytes := int64(ms.state.Bytes)
 	ms.msgs[seq] = &storedMsg{subj, hdr, msg, seq, ts}
 	ms.state.Msgs++
 	ms.state.Bytes += memStoreMsgSize(subj, hdr, msg)
 	ms.state.LastSeq = seq
-	ms.state.LastTime = now.UTC()
+	ms.state.LastTime = now
 
 	// Limits checks and enforcement.
 	ms.enforceMsgLimit()
@@ -130,15 +127,39 @@ func (ms *memStore) StoreMsg(subj string, hdr, msg []byte) (uint64, int64, error
 	if ms.ageChk == nil && ms.cfg.MaxAge != 0 {
 		ms.startAgeChk()
 	}
+
+	return nil
+}
+
+// StoreRawMsg stores a raw message with expected sequence number and timestamp.
+func (ms *memStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts int64) error {
+	ms.mu.Lock()
+	err := ms.storeRawMsg(subj, hdr, msg, seq, ts)
 	cb := ms.scb
-	stopBytes := int64(ms.state.Bytes)
 	ms.mu.Unlock()
 
-	if cb != nil {
-		cb(1, stopBytes-startBytes, seq, subj)
+	if err == nil && cb != nil {
+		cb(1, int64(memStoreMsgSize(subj, hdr, msg)), seq, subj)
 	}
 
-	return seq, ts, nil
+	return err
+}
+
+// Store stores a message.
+func (ms *memStore) StoreMsg(subj string, hdr, msg []byte) (uint64, int64, error) {
+	ms.mu.Lock()
+	seq, ts := ms.state.LastSeq+1, time.Now().UnixNano()
+	err := ms.storeRawMsg(subj, hdr, msg, seq, ts)
+	cb := ms.scb
+	ms.mu.Unlock()
+
+	if err != nil {
+		seq, ts = 0, 0
+	} else if cb != nil {
+		cb(1, int64(memStoreMsgSize(subj, hdr, msg)), seq, subj)
+	}
+
+	return seq, ts, err
 }
 
 // SkipMsg will use the next sequence number but not store anything.
@@ -428,10 +449,8 @@ func (ms *memStore) removeMsg(seq uint64, secure bool) bool {
 	}
 
 	if ms.scb != nil {
-		ms.mu.Unlock()
 		delta := int64(ss)
 		ms.scb(-1, -delta, seq, sm.subj)
-		ms.mu.Lock()
 	}
 
 	return ok

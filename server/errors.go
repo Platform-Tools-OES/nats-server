@@ -190,6 +190,9 @@ var (
 
 	// ErrJetStreamNotAssigned is returned when the resource (stream or consumer) is not assigned.
 	ErrJetStreamNotAssigned = errors.New("jetstream cluster not assigned to this server")
+
+	// ErrJetStreamNotClustered is returned when a call requires clustering and we are not.
+	ErrJetStreamNotClustered = errors.New("jetstream not in clustered mode")
 )
 
 // configErr is a configuration error.

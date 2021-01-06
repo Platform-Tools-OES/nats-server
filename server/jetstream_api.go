@@ -933,10 +933,17 @@ func (s *Server) jsStreamNamesRequest(sub *subscription, c *client, subject, rep
 		js.mu.RLock()
 		for stream, sa := range cc.streams[acc.Name] {
 			if filter != _EMPTY_ {
-				for _, subj := range sa.Config.Subjects {
-					if SubjectsCollide(filter, subj) {
+				// These could not have subjects auto-filled in since they are raw and unprocessed.
+				if len(sa.Config.Subjects) == 0 {
+					if SubjectsCollide(filter, sa.Config.Name) {
 						resp.Streams = append(resp.Streams, stream)
-						break
+					}
+				} else {
+					for _, subj := range sa.Config.Subjects {
+						if SubjectsCollide(filter, subj) {
+							resp.Streams = append(resp.Streams, stream)
+							break
+						}
 					}
 				}
 			} else {

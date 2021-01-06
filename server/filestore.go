@@ -699,44 +699,45 @@ func (fs *fileStore) enableLastMsgBlockForWriting() error {
 	return nil
 }
 
-// Store stores a message. We hold the main filestore lock for any write operation.
-func (fs *fileStore) StoreMsg(subj string, hdr, msg []byte) (uint64, int64, error) {
-	fs.mu.Lock()
-
+// Stores a raw message with expected sequence number and timestamp.
+// Lock should be held.
+func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts int64) error {
 	if fs.closed {
-		fs.mu.Unlock()
-		return 0, 0, ErrStoreClosed
+		return ErrStoreClosed
 	}
 
 	// Check if we are discarding new messages when we reach the limit.
 	if fs.cfg.Discard == DiscardNew {
 		if fs.cfg.MaxMsgs > 0 && fs.state.Msgs >= uint64(fs.cfg.MaxMsgs) {
-			fs.mu.Unlock()
-			return 0, 0, ErrMaxMsgs
+			return ErrMaxMsgs
 		}
 		if fs.cfg.MaxBytes > 0 && fs.state.Bytes+uint64(len(msg)+len(hdr)) >= uint64(fs.cfg.MaxBytes) {
-			fs.mu.Unlock()
-			return 0, 0, ErrMaxBytes
+			return ErrMaxBytes
 		}
 	}
 
-	seq := fs.state.LastSeq + 1
-
-	n, ts, err := fs.writeMsgRecord(seq, subj, hdr, msg)
-	if err != nil {
-		fs.mu.Unlock()
-		return 0, 0, err
+	// Check sequence.
+	if seq != fs.state.LastSeq+1 {
+		return ErrSequenceMismatch
 	}
 
+	// Write msg record.
+	n, err := fs.writeMsgRecord(seq, ts, subj, hdr, msg)
+	if err != nil {
+		return err
+	}
+
+	// Adjust first if needed.
+	now := time.Unix(0, ts).UTC()
 	if fs.state.Msgs == 0 {
 		fs.state.FirstSeq = seq
-		fs.state.FirstTime = time.Unix(0, ts).UTC()
+		fs.state.FirstTime = now
 	}
 
 	fs.state.Msgs++
 	fs.state.Bytes += n
 	fs.state.LastSeq = seq
-	fs.state.LastTime = time.Unix(0, ts).UTC()
+	fs.state.LastTime = now
 
 	// Limits checks and enforcement.
 	// If they do any deletions they will update the
@@ -748,15 +749,39 @@ func (fs *fileStore) StoreMsg(subj string, hdr, msg []byte) (uint64, int64, erro
 	if fs.ageChk == nil && fs.cfg.MaxAge != 0 {
 		fs.startAgeChk()
 	}
+
+	return nil
+}
+
+// StoreRawMsg stores a raw message with expected sequence number and timestamp.
+func (fs *fileStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts int64) error {
+	fs.mu.Lock()
+	err := fs.storeRawMsg(subj, hdr, msg, seq, ts)
 	cb := fs.scb
 	fs.mu.Unlock()
 
-	// Update the upper layers regarding storage used.
-	if cb != nil {
-		cb(1, int64(n), seq, subj)
+	if err == nil && cb != nil {
+		cb(1, int64(fileStoreMsgSize(subj, hdr, msg)), seq, subj)
 	}
 
-	return seq, ts, nil
+	return err
+}
+
+// Store stores a message. We hold the main filestore lock for any write operation.
+func (fs *fileStore) StoreMsg(subj string, hdr, msg []byte) (uint64, int64, error) {
+	fs.mu.Lock()
+	seq, ts := fs.state.LastSeq+1, time.Now().UnixNano()
+	err := fs.storeRawMsg(subj, hdr, msg, seq, ts)
+	cb := fs.scb
+	fs.mu.Unlock()
+
+	if err != nil {
+		seq, ts = 0, 0
+	} else if cb != nil {
+		cb(1, int64(fileStoreMsgSize(subj, hdr, msg)), seq, subj)
+	}
+
+	return seq, ts, err
 }
 
 // skipMsg will update this message block for a skipped message.
@@ -1640,29 +1665,26 @@ func (mb *msgBlock) updateAccounting(seq uint64, ts int64, rl uint64) {
 }
 
 // Lock should be held.
-func (fs *fileStore) writeMsgRecord(seq uint64, subj string, mhdr, msg []byte) (uint64, int64, error) {
+func (fs *fileStore) writeMsgRecord(seq uint64, ts int64, subj string, hdr, msg []byte) (uint64, error) {
 	var err error
 
 	// Get size for this message.
-	rl := fileStoreMsgSize(subj, mhdr, msg)
+	rl := fileStoreMsgSize(subj, hdr, msg)
 	if rl&hbit != 0 {
-		return 0, 0, ErrMsgTooLarge
+		return 0, ErrMsgTooLarge
 	}
 	// Grab our current last message block.
 	mb := fs.lmb
 	if mb == nil || mb.numBytes()+rl > fs.fcfg.BlockSize {
 		if mb, err = fs.newMsgBlockForWrite(); err != nil {
-			return 0, 0, err
+			return 0, err
 		}
 	}
 
-	// Grab time
-	ts := time.Now().UnixNano()
-
 	// Ask msg block to store in write through cache.
-	mb.writeMsgRecord(rl, seq, subj, mhdr, msg, ts)
+	mb.writeMsgRecord(rl, seq, subj, hdr, msg, ts)
 
-	return rl, ts, nil
+	return rl, nil
 }
 
 // Sync msg and index files as needed. This is called from a timer.
