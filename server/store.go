@@ -1,4 +1,4 @@
-// Copyright 2019-2020 The NATS Authors
+// Copyright 2019-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -40,7 +40,7 @@ var (
 	// ErrStoreMsgNotFound when message was not found but was expected to be.
 	ErrStoreMsgNotFound = errors.New("no message found")
 	// ErrStoreEOF is returned when message seq is greater than the last sequence.
-	ErrStoreEOF = errors.New("stream EOF")
+	ErrStoreEOF = errors.New("stream store EOF")
 	// ErrMaxMsgs is returned when we have discard new as a policy and we reached the message limit.
 	ErrMaxMsgs = errors.New("maximum messages exceeded")
 	// ErrMaxBytes is returned when we have discard new as a policy and we reached the bytes limit.
@@ -54,6 +54,8 @@ var (
 	ErrStoreWrongType = errors.New("wrong storage type")
 	// ErrNoAckPolicy is returned when trying to update a consumer's acks with no ack policy.
 	ErrNoAckPolicy = errors.New("ack policy is none")
+	// ErrInvalidSequence is returned when the sequence is not present in the stream store.
+	ErrInvalidSequence = errors.New("invalid sequence")
 	// ErrSequenceMismatch is returned when storing a raw message and the expected sequence is wrong.
 	ErrSequenceMismatch = errors.New("expected sequence does not match store")
 )
@@ -71,6 +73,7 @@ type StreamStore interface {
 	EraseMsg(seq uint64) (bool, error)
 	Purge() (uint64, error)
 	Compact(seq uint64) (uint64, error)
+	Truncate(seq uint64) error
 	GetSeqFromTime(t time.Time) uint64
 	State() StreamState
 	RegisterStorageUpdates(StorageUpdateHandler)

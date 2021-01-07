@@ -1,4 +1,4 @@
-// Copyright 2019-2020 The NATS Authors
+// Copyright 2019-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -1220,6 +1220,70 @@ func (mb *msgBlock) eraseMsg(seq uint64, ri, rl int) error {
 	return nil
 }
 
+// Truncate this message block to the storedMsg.
+func (mb *msgBlock) truncate(sm *fileStoredMsg) (nmsgs, nbytes uint64, err error) {
+	// Make sure we are loaded to process messages etc.
+	if err := mb.loadMsgs(); err != nil {
+		return 0, 0, err
+	}
+
+	// Calculate new eof using slot info from our new last sm.
+	ri, rl, _, err := mb.slotInfo(int(sm.seq - mb.cache.fseq))
+	eof := int64(ri + rl)
+
+	var purged, bytes uint64
+
+	mb.mu.Lock()
+	checkDmap := len(mb.dmap) > 0
+	for seq := mb.last.seq; seq > sm.seq; seq-- {
+		if checkDmap {
+			if _, ok := mb.dmap[seq]; ok {
+				// Delete and skip to next.
+				delete(mb.dmap, seq)
+				continue
+			}
+		}
+		// We should have a valid msg to calculate removal stats.
+		_, rl, _, err := mb.slotInfo(int(seq - mb.cache.fseq))
+		if err != nil {
+			mb.mu.Unlock()
+			return 0, 0, err
+		}
+		purged++
+		bytes += uint64(rl)
+	}
+
+	// Truncate our msgs and close file.
+	if mb.mfd != nil {
+		mb.mfd.Truncate(eof)
+		mb.mfd.Sync()
+		// Update our checksum.
+		var lchk [8]byte
+		mb.mfd.ReadAt(lchk[:], eof-8)
+		copy(mb.lchk[0:], lchk[:])
+	} else {
+		return 0, 0, fmt.Errorf("failed to truncate msg block %d, file not open", mb.index)
+	}
+
+	// Do local mb stat updates.
+	mb.msgs -= purged
+	mb.bytes -= bytes
+	// Update our last msg.
+	mb.last.seq = sm.seq
+	mb.last.ts = sm.ts
+
+	// Clear our cache.
+	mb.clearCacheAndOffset()
+	mb.mu.Unlock()
+
+	// Write our index file.
+	mb.writeIndexInfo()
+	// Load msgs again.
+	mb.loadMsgs()
+
+	return purged, bytes, nil
+}
+
 // Lock should be held.
 func (mb *msgBlock) isEmpty() bool {
 	return mb.first.seq > mb.last.seq
@@ -1708,8 +1772,8 @@ func (fs *fileStore) syncBlocks() {
 			mfd.Sync()
 		}
 		if ifd != nil {
-			ifd.Sync()
 			ifd.Truncate(liwsz)
+			ifd.Sync()
 		}
 	}
 
@@ -2515,6 +2579,73 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 	}
 
 	return purged, nil
+}
+
+// Truncate will truncate a stream store up to and including seq. Sequence needs to be valid.
+func (fs *fileStore) Truncate(seq uint64) error {
+	fs.mu.Lock()
+
+	if fs.closed {
+		fs.mu.Unlock()
+		return ErrStoreClosed
+	}
+	if fs.sips > 0 {
+		fs.mu.Unlock()
+		return ErrStoreSnapshotInProgress
+	}
+
+	nlmb := fs.selectMsgBlock(seq)
+	if nlmb == nil {
+		fs.mu.Unlock()
+		return ErrInvalidSequence
+	}
+	lsm, _ := nlmb.fetchMsg(seq)
+	if lsm == nil {
+		fs.mu.Unlock()
+		return ErrInvalidSequence
+	}
+
+	// Set lmb to nlmb and make sure writeable.
+	fs.lmb = nlmb
+	fs.enableLastMsgBlockForWriting()
+
+	var purged, bytes uint64
+
+	// Truncate our new last message block.
+	nmsgs, nbytes, err := nlmb.truncate(lsm)
+	if err != nil {
+		fs.mu.Unlock()
+		return err
+	}
+	// Account for the truncated msgs and bytes.
+	purged += nmsgs
+	bytes += nbytes
+
+	// Remove any left over msg blocks.
+	getLastMsgBlock := func() *msgBlock { return fs.blks[len(fs.blks)-1] }
+	for mb := getLastMsgBlock(); mb != nlmb; mb = getLastMsgBlock() {
+		mb.mu.Lock()
+		purged += mb.msgs
+		bytes += mb.bytes
+		fs.removeMsgBlock(mb)
+		mb.mu.Unlock()
+	}
+
+	// Reset last.
+	fs.state.LastSeq = lsm.seq
+	fs.state.LastTime = time.Unix(0, lsm.ts).UTC()
+	// Update msgs and bytes.
+	fs.state.Msgs -= purged
+	fs.state.Bytes -= bytes
+
+	cb := fs.scb
+	fs.mu.Unlock()
+
+	if cb != nil {
+		cb(-int64(purged), -int64(bytes), 0, _EMPTY_)
+	}
+
+	return nil
 }
 
 func (fs *fileStore) resetFirst(newFirst uint64) {

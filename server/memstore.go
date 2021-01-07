@@ -1,4 +1,4 @@
-// Copyright 2019-2020 The NATS Authors
+// Copyright 2019-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -318,13 +318,13 @@ func (ms *memStore) Compact(seq uint64) (uint64, error) {
 		ms.state.FirstTime = time.Unix(0, sm.ts).UTC()
 
 		for seq := seq - 1; seq > 0; seq-- {
-			sm := ms.msgs[seq]
-			if sm == nil {
-				continue
+			if sm := ms.msgs[seq]; sm != nil {
+				bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
+				purged++
+				delete(ms.msgs, seq)
+			} else {
+				delete(ms.dmap, seq)
 			}
-			bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
-			purged++
-			delete(ms.msgs, seq)
 		}
 		ms.state.Msgs -= purged
 		ms.state.Bytes -= bytes
@@ -347,6 +347,42 @@ func (ms *memStore) Compact(seq uint64) (uint64, error) {
 	}
 
 	return purged, nil
+}
+
+// Truncate will truncate a stream store up to and including seq. Sequence needs to be valid.
+func (ms *memStore) Truncate(seq uint64) error {
+	var purged, bytes uint64
+
+	ms.mu.Lock()
+	lsm, ok := ms.msgs[seq]
+	if !ok {
+		ms.mu.Unlock()
+		return ErrInvalidSequence
+	}
+
+	for i := ms.state.LastSeq; i > seq; i-- {
+		if sm := ms.msgs[i]; sm != nil {
+			purged++
+			bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
+			delete(ms.msgs, seq)
+		} else {
+			delete(ms.dmap, i)
+		}
+	}
+	// Reset last.
+	ms.state.LastSeq = lsm.seq
+	ms.state.LastTime = time.Unix(0, lsm.ts).UTC()
+	// Update msgs and bytes.
+	ms.state.Msgs -= purged
+	ms.state.Bytes -= bytes
+	cb := ms.scb
+	ms.mu.Unlock()
+
+	if cb != nil {
+		cb(-int64(purged), -int64(bytes), 0, _EMPTY_)
+	}
+
+	return nil
 }
 
 func (ms *memStore) deleteFirstMsgOrPanic() {

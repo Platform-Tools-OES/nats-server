@@ -1,4 +1,4 @@
-// Copyright 2019-2020 The NATS Authors
+// Copyright 2019-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -343,5 +343,50 @@ func TestMemStoreStreamStateDeleted(t *testing.T) {
 	ms.Purge()
 	if state = ms.State(); len(state.Deleted) != 0 {
 		t.Fatalf("Expected no deleted after purge, got %+v\n", state.Deleted)
+	}
+}
+
+func TestMemStoreStreamTruncate(t *testing.T) {
+	ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error creating store: %v", err)
+	}
+
+	subj, toStore := "foo", uint64(100)
+	for i := uint64(1); i <= toStore; i++ {
+		if _, _, err := ms.StoreMsg(subj, nil, []byte("ok")); err != nil {
+			t.Fatalf("Error storing msg: %v", err)
+		}
+	}
+	if state := ms.State(); state.Msgs != toStore {
+		t.Fatalf("Expected %d msgs, got %d", toStore, state.Msgs)
+	}
+
+	// Check that sequence has to be interior.
+	if err := ms.Truncate(toStore + 1); err != ErrInvalidSequence {
+		t.Fatalf("Expected err of '%v', got '%v'", ErrInvalidSequence, err)
+	}
+
+	tseq := uint64(50)
+	if err := ms.Truncate(tseq); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if state := ms.State(); state.Msgs != tseq {
+		t.Fatalf("Expected %d msgs, got %d", tseq, state.Msgs)
+	}
+
+	// Now make sure we report properly if we have some deleted interior messages.
+	ms.RemoveMsg(10)
+	ms.RemoveMsg(20)
+	ms.RemoveMsg(30)
+	ms.RemoveMsg(40)
+
+	tseq = uint64(25)
+	if err := ms.Truncate(tseq); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	expected := []uint64{10, 20}
+	if state := ms.State(); !reflect.DeepEqual(state.Deleted, expected) {
+		t.Fatalf("Expected deleted to be %+v, got %+v\n", expected, state.Deleted)
 	}
 }

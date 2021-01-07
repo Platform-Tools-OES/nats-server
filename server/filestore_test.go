@@ -1,4 +1,4 @@
-// Copyright 2019-2020 The NATS Authors
+// Copyright 2019-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -784,6 +784,76 @@ func TestFileStoreCompact(t *testing.T) {
 	}
 	if state = fs.State(); state.FirstSeq != 100 {
 		t.Fatalf("Expected first seq of 100, got %d", state.FirstSeq)
+	}
+}
+
+func TestFileStoreStreamTruncate(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, _, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 350},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	subj, toStore := "foo", uint64(100)
+	for i := uint64(1); i <= toStore; i++ {
+		if _, _, err := fs.StoreMsg(subj, nil, []byte("ok")); err != nil {
+			t.Fatalf("Error storing msg: %v", err)
+		}
+	}
+	if state := fs.State(); state.Msgs != toStore {
+		t.Fatalf("Expected %d msgs, got %d", toStore, state.Msgs)
+	}
+
+	// Check that sequence has to be interior.
+	if err := fs.Truncate(toStore + 1); err != ErrInvalidSequence {
+		t.Fatalf("Expected err of '%v', got '%v'", ErrInvalidSequence, err)
+	}
+
+	tseq := uint64(50)
+	if err := fs.Truncate(tseq); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if state := fs.State(); state.Msgs != tseq {
+		t.Fatalf("Expected %d msgs, got %d", tseq, state.Msgs)
+	}
+
+	// Now make sure we report properly if we have some deleted interior messages.
+	fs.RemoveMsg(10)
+	fs.RemoveMsg(20)
+	fs.RemoveMsg(30)
+	fs.RemoveMsg(40)
+
+	tseq = uint64(25)
+	if err := fs.Truncate(tseq); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if state := fs.State(); state.Msgs != tseq-2 {
+		t.Fatalf("Expected %d msgs, got %d", tseq-2, state.Msgs)
+	}
+	expected := []uint64{10, 20}
+	if state := fs.State(); !reflect.DeepEqual(state.Deleted, expected) {
+		t.Fatalf("Expected deleted to be %+v, got %+v\n", expected, state.Deleted)
+	}
+
+	before := fs.State()
+
+	// Make sure we can recover same state.
+	fs.Stop()
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	if state := fs.State(); !reflect.DeepEqual(state, before) {
+		t.Fatalf("Expected state of %+v, got %+v", before, state)
 	}
 }
 
