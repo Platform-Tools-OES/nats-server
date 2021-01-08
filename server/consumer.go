@@ -209,7 +209,9 @@ type Consumer struct {
 	deliveryExcEventT string
 	created           time.Time
 	closed            bool
-	node              RaftNode
+
+	// Clustered.
+	node RaftNode
 }
 
 const (

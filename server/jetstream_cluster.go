@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"math/rand"
 	"path"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/compress/s2"
@@ -73,6 +75,7 @@ type streamAssignment struct {
 	Client *ClientInfo   `json:"client,omitempty"`
 	Config *StreamConfig `json:"stream"`
 	Group  *raftGroup    `json:"group"`
+	Sync   string        `json:"sync"`
 	Reply  string        `json:"reply"`
 	// Internal
 	consumers map[string]*consumerAssignment
@@ -592,6 +595,7 @@ type writeableStreamAssignment struct {
 	Client    *ClientInfo   `json:"client,omitempty"`
 	Config    *StreamConfig `json:"stream"`
 	Group     *raftGroup    `json:"group"`
+	Sync      string        `json:"sync"`
 	Consumers []*consumerAssignment
 }
 
@@ -605,6 +609,7 @@ func (js *jetStream) metaSnapshot() []byte {
 				Client: sa.Client,
 				Config: sa.Config,
 				Group:  sa.Group,
+				Sync:   sa.Sync,
 			}
 			for _, ca := range sa.consumers {
 				wsa.Consumers = append(wsa.Consumers, ca)
@@ -640,7 +645,7 @@ func (js *jetStream) applyMetaSnapshot(buf []byte) error {
 			as = make(map[string]*streamAssignment)
 			streams[wsa.Client.Account] = as
 		}
-		sa := &streamAssignment{Client: wsa.Client, Config: wsa.Config, Group: wsa.Group}
+		sa := &streamAssignment{Client: wsa.Client, Config: wsa.Config, Group: wsa.Group, Sync: wsa.Sync}
 		if len(wsa.Consumers) > 0 {
 			sa.consumers = make(map[string]*consumerAssignment)
 			for _, ca := range wsa.Consumers {
@@ -886,7 +891,7 @@ func (js *jetStream) applyStreamEntries(mset *Stream, ce *CommittedEntry) {
 	fmt.Printf("[%s] JS GROUP %q HAS STREAM ENTRIES UPDATE TO APPLY!\n", js.srv, mset.node.Group())
 	for _, e := range ce.Entries {
 		if e.Type == EntrySnapshot {
-			fmt.Printf("[%s] SNAPSHOT STREAM ENTRY\n", js.srv)
+			mset.processSnapshot(e.Data)
 		} else {
 			buf := e.Data
 			switch entryOp(buf[0]) {
@@ -974,6 +979,7 @@ func (js *jetStream) processStreamLeaderChange(mset *Stream, sa *streamAssignmen
 	}
 
 	// Check if we need to respond to the original request.
+	// FIXME(dlc) - This approach does not do what we really want. Needs to be fixed.
 	js.mu.Lock()
 	responded, err := sa.responded, sa.err
 	sa.responded = true
@@ -1085,6 +1091,8 @@ func (js *jetStream) processStreamRemoval(sa *streamAssignment) {
 	js.processClusterDeleteStream(sa, wasLeader)
 }
 
+// processClusterCreateStream is called when we have a stream assignment that
+// has been committed and this server is a member of the peer group.
 func (js *jetStream) processClusterCreateStream(sa *streamAssignment) {
 	if sa == nil {
 		return
@@ -1115,7 +1123,7 @@ func (js *jetStream) processClusterCreateStream(sa *streamAssignment) {
 		}
 	} else {
 		// Add in the stream here.
-		mset, sa.err = acc.addStream(sa.Config, nil, rg.node)
+		mset, sa.err = acc.addStream(sa.Config, nil, sa)
 		// Start our monitoring routine.
 		if rg.node != nil {
 			s.startGoRoutine(func() { js.monitorStreamRaftGroup(mset, sa) })
@@ -1597,6 +1605,16 @@ func (cc *jetStreamCluster) createGroupForStream(cfg *StreamConfig) *raftGroup {
 	return &raftGroup{Name: groupNameForStream(peers, cfg.Storage), Storage: cfg.Storage, Peers: peers}
 }
 
+func syncSubjForStream() string {
+	var b [replySuffixLen]byte
+	rn := rand.Int63()
+	for i, l := 0, rn; i < len(b); i++ {
+		b[i] = digits[l%base]
+		l /= base
+	}
+	return fmt.Sprintf("$SYS.JSC.SYNC.%s", b[:])
+}
+
 func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, subject, reply string, rmsg []byte, cfg *StreamConfig) {
 	fmt.Printf("[%s:%s]\tWill answer stream create!\n", s.Name(), s.js.nodeID())
 	js, cc := s.getJetStreamCluster()
@@ -1607,6 +1625,7 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, subject, reply string,
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
+	// Raft group selection and placement.
 	rg := cc.createGroupForStream(cfg)
 	if rg == nil {
 		fmt.Printf("[%s:%s]\tNo group selected!\n", s.Name(), s.js.nodeID())
@@ -1616,8 +1635,10 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, subject, reply string,
 		s.sendAPIResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
 	}
+	// Sync subject for post snapshot sync.
+	sync := syncSubjForStream()
 
-	sa := &streamAssignment{Group: rg, Config: cfg, Reply: reply, Client: ci}
+	sa := &streamAssignment{Group: rg, Sync: sync, Config: cfg, Reply: reply, Client: ci}
 	cc.meta.Propose(encodeAddStreamAssignment(sa))
 }
 
@@ -1959,4 +1980,239 @@ func (mset *Stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 	}
 
 	return err
+}
+
+// For requesting messages post raft snapshot to catch up streams post server restart.
+// Any deleted msgs etc will be handled inline on catchup.
+type streamSyncRequest struct {
+	FirstSeq uint64 `json:"first_seq"`
+	LastSeq  uint64 `json:"last_seq"`
+}
+
+// Given a stream state that represents a snapshot, calculate the sync request based on our current state.
+func (mset *Stream) calculateSyncRequest(state, snap *StreamState) *streamSyncRequest {
+	// Quick check if we are already caught up.
+	if state.LastSeq >= snap.LastSeq {
+		return nil
+	}
+	fmt.Printf("[%s] CURRENT STATE  - %+v\n", mset.srv, state)
+	fmt.Printf("[%s] SNAPSHOT STATE - %+v\n", mset.srv, snap)
+
+	return &streamSyncRequest{
+		FirstSeq: state.LastSeq + 1,
+		LastSeq:  snap.LastSeq,
+	}
+}
+
+// processSnapshotDeletes will update our current store based on the snapshot
+// but only processing deletes and new FirstSeq / purges.
+func (mset *Stream) processSnapshotDeletes(snap *StreamState) {
+	state := mset.store.State()
+
+	// Adjust if FirstSeq has moved.
+	if snap.FirstSeq > state.FirstSeq {
+		mset.store.Compact(snap.FirstSeq)
+		state = mset.store.State()
+	}
+	// Range the deleted and delete if applicable.
+	for _, dseq := range snap.Deleted {
+		if dseq <= state.LastSeq {
+			mset.store.RemoveMsg(dseq)
+		}
+	}
+}
+
+// Process a stream snapshot.
+func (mset *Stream) processSnapshot(buf []byte) {
+	var snap StreamState
+	if err := json.Unmarshal(buf, &snap); err != nil {
+		// Log error.
+		return
+	}
+
+	fmt.Printf("[%s] SNAPSHOT STREAM ENTRY\n", mset.srv)
+
+	// Update any deletes, etc.
+	mset.processSnapshotDeletes(&snap)
+
+	mset.mu.Lock()
+	state := mset.store.State()
+	sreq := mset.calculateSyncRequest(&state, &snap)
+	if sreq != nil {
+	}
+	s, subject := mset.srv, mset.sa.Sync
+	mset.mu.Unlock()
+
+	fmt.Printf("[%s] SYNC REQUEST WOULD BE %+v\n", mset.srv, sreq)
+
+	// Send our catchup request here if needed.
+	if sreq != nil {
+		reply := syncReplySubject()
+		sub, _ := s.sysSubscribe(reply, mset.handleClusterSyncResponses)
+		mset.mu.Lock()
+		mset.replaySub = sub
+		mset.mu.Unlock()
+		s.sendInternalMsgLocked(subject, reply, nil, sreq)
+	}
+}
+
+func (mset *Stream) handleClusterSyncRequest(sub *subscription, c *client, subject, reply string, msg []byte) {
+	fmt.Printf("\n\n[%s] RECEIVED A SYNC/CATCHUP REQUEST - %q - %q\n", mset.srv, reply, msg)
+
+	var sreq streamSyncRequest
+	if err := json.Unmarshal(msg, &sreq); err != nil {
+		// Log error.
+		return
+	}
+	fmt.Printf("[%s] SREQ IS %+v\n", mset.srv, sreq)
+
+	mset.srv.startGoRoutine(func() { mset.runCatchup(reply, &sreq) })
+}
+
+func (mset *Stream) runCatchup(sendSubject string, sreq *streamSyncRequest) {
+	s := mset.srv
+	defer s.grWG.Done()
+
+	const maxOut = int64(48 * 1024 * 1024) // 48MB for now.
+	out := int64(0)
+
+	// Flow control processing.
+	const expectedTokens = 5
+	ackReplySize := func(subj string) int64 {
+		tsa := [expectedTokens]string{}
+		start, tokens := 0, tsa[:0]
+		for i := 0; i < len(subj); i++ {
+			if subj[i] == btsep {
+				tokens = append(tokens, subj[start:i])
+				start = i + 1
+			}
+		}
+		tokens = append(tokens, subj[start:])
+		if len(tokens) != expectedTokens {
+			return 0
+		}
+		return parseAckReplyNum(tokens[expectedTokens-1])
+	}
+
+	nextBatchC := make(chan struct{}, 1)
+	nextBatchC <- struct{}{}
+
+	// Setup ackReply for flow control.
+	ackReply := syncAckSubject()
+	ackSub, _ := s.sysSubscribe(ackReply, func(sub *subscription, c *client, subject, reply string, msg []byte) {
+		sz := ackReplySize(subject)
+		atomic.AddInt64(&out, -sz)
+		select {
+		case nextBatchC <- struct{}{}:
+		}
+		fmt.Printf("[%s] GOT SYNC ACK REPLY! %q - %d\n", s, subject, sz)
+	})
+	defer s.sysUnsubscribe(ackSub)
+	ackReplyT := strings.ReplaceAll(ackReply, ".*", ".%d")
+
+	// Setup sequences to walk through.
+	seq, last := sreq.FirstSeq, sreq.LastSeq
+
+	sendNextBatch := func() {
+		for ; seq < last && atomic.LoadInt64(&out) <= maxOut; seq++ {
+			subj, hdr, msg, ts, err := mset.store.LoadMsg(seq)
+			if err != nil {
+				if err == ErrStoreEOF {
+					// break, something changed.
+				} else if err == ErrStoreMsgNotFound {
+					// Send deleteOp/skipOp
+				}
+			}
+			// S2?
+			em := encodeStreamMsg(subj, _EMPTY_, hdr, msg, seq-1, ts)
+			// Place size in reply subject for flow control.
+			reply := fmt.Sprintf(ackReplyT, len(em))
+			atomic.AddInt64(&out, int64(len(em)))
+			s.sendInternalMsgLocked(sendSubject, reply, nil, em)
+		}
+	}
+
+	const activityInterval = 500 * time.Millisecond
+	timeout := time.NewTicker(activityInterval)
+	defer timeout.Stop()
+
+	// Grab stream quit channel.
+	mset.mu.RLock()
+	qch := mset.qch
+	mset.mu.RUnlock()
+	if qch == nil {
+		return
+	}
+
+	// Run as long as we are still active and need catchup.
+	// FIXME(dlc) - Purge event? Stream delete?
+	for {
+		select {
+		case <-s.quitCh:
+			return
+		case <-qch:
+			return
+		case <-timeout.C:
+			fmt.Printf("[%s] STREAM Catching up for %q stalled\n", s, mset.config.Name)
+			return
+		case <-nextBatchC:
+			// Update our activity timer.
+			timeout.Reset(activityInterval)
+			if seq >= last {
+				fmt.Printf("[%s] DONE RESYNC ON STREAM, EXITING\n", s)
+				return
+			}
+			// Still have more catching up to do.
+			sendNextBatch()
+		}
+	}
+}
+
+func (mset *Stream) handleClusterSyncResponses(sub *subscription, c *client, subject, reply string, msg []byte) {
+	s := mset.srv
+
+	fmt.Printf("\n\n[%s] RECEIVED A SYNC/CATCHUP RESPONSE\n", s)
+	if len(msg) < 1 {
+		// FIXME(dlc) - log
+		return
+	}
+
+	switch entryOp(msg[0]) {
+	case streamMsgOp:
+		subj, _, hdr, msg, lseq, ts, err := decodeStreamMsg(msg[1:])
+		if err != nil {
+			// TODO(dlc) - Bail?
+		}
+		fmt.Printf("[%s] Received replay msg of %q %q %q %d %d\n", mset.srv, subj, hdr, msg, lseq, ts)
+		// Put into store
+		// For flow control.
+		if reply != _EMPTY_ {
+			fmt.Printf("[%s] Sending ack flow response to %q\n", mset.srv, reply)
+			s.sendInternalMsgLocked(reply, _EMPTY_, nil, nil)
+			fmt.Printf("[%s] DONE Sending ack flow response to %q\n", mset.srv, reply)
+		}
+	case deleteMsgOp:
+
+	}
+
+}
+
+func syncReplySubject() string {
+	var b [replySuffixLen]byte
+	rn := rand.Int63()
+	for i, l := 0, rn; i < len(b); i++ {
+		b[i] = digits[l%base]
+		l /= base
+	}
+	return fmt.Sprintf("$SYS.JSC.R.%s", b[:])
+}
+
+func syncAckSubject() string {
+	var b [replySuffixLen]byte
+	rn := rand.Int63()
+	for i, l := 0, rn; i < len(b); i++ {
+		b[i] = digits[l%base]
+		l /= base
+	}
+	return fmt.Sprintf("$SYS.JSC.ACK.%s.*", b[:])
 }

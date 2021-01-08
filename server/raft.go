@@ -318,7 +318,7 @@ func (n *raft) Propose(data []byte) error {
 	propc := n.propc
 	n.RUnlock()
 
-	n.debug("PROPOSE CALLED %q\n", data)
+	n.debug("PROPOSE CALLED\n")
 
 	select {
 	case propc <- &Entry{EntryNormal, data}:
@@ -547,6 +547,10 @@ func (n *raft) QuitC() <-chan struct{}         { return n.quit }
 
 func (n *raft) shutdown() {
 	n.Lock()
+	if n.state == Closed {
+		n.Unlock()
+		return
+	}
 	close(n.quit)
 	n.c.closeConnection(InternalClient)
 	n.state = Closed
@@ -1235,11 +1239,11 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 			// Snapshots will always be by themselves.
 			if catchingUp && len(ae.entries) > 0 && ae.entries[0].Type == EntrySnapshot {
 				n.debug("Should reset index for wal to %d\n", ae.pindex+1)
-				n.debug("Old wal state is %+v\n", n.wal.State())
+				//n.debug("Old wal state is %+v\n", n.wal.State())
 				n.wal.Compact(ae.pindex + 1)
 				n.pindex = ae.pindex
 				n.commit = ae.pindex
-				n.debug("New wal state is %+v\n", n.wal.State())
+				//n.debug("New wal state is %+v\n", n.wal.State())
 			} else {
 				n.debug("DID NOT MATCH %d %d with %d %d\n", ae.pterm, ae.pindex, n.pterm, n.pindex)
 				if n.catchup != nil {
@@ -1360,8 +1364,10 @@ func (n *raft) storeToWAL(ae *appendEntry) error {
 	if err != nil {
 		return err
 	}
+
 	//n.debug("StoreToWAL called, term %d index %d - %q\n", n.term, seq, ae.buf[47:])
-	n.debug("WAL state is %+v\n", n.wal.State())
+	//n.debug("WAL state is %+v\n", n.wal.State())
+
 	n.pterm = ae.term
 	n.pindex = seq
 	return nil

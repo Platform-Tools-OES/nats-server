@@ -87,6 +87,7 @@ type StreamInfo struct {
 type Stream struct {
 	mu        sync.RWMutex
 	jsa       *jsAccount
+	srv       *Server
 	client    *client
 	sid       int
 	pubAck    []byte
@@ -102,7 +103,13 @@ type Stream struct {
 	ddarr     []*ddentry
 	ddindex   int
 	ddtmr     *time.Timer
+	qch       chan struct{}
+
+	// Clustered mode.
+	sa        *streamAssignment
 	node      RaftNode
+	syncSub   *subscription
+	replaySub *subscription
 	nlseq     uint64
 }
 
@@ -137,7 +144,7 @@ func (a *Account) AddStreamWithStore(config *StreamConfig, fsConfig *FileStoreCo
 	return a.addStream(config, fsConfig, nil)
 }
 
-func (a *Account) addStream(config *StreamConfig, fsConfig *FileStoreConfig, node RaftNode) (*Stream, error) {
+func (a *Account) addStream(config *StreamConfig, fsConfig *FileStoreConfig, sa *streamAssignment) (*Stream, error) {
 	s, jsa, err := a.checkForJetStream()
 	if err != nil {
 		return nil, err
@@ -187,7 +194,7 @@ func (a *Account) addStream(config *StreamConfig, fsConfig *FileStoreConfig, nod
 
 	// Setup the internal client.
 	c := s.createInternalJetStreamClient()
-	mset := &Stream{jsa: jsa, config: cfg, client: c, consumers: make(map[string]*Consumer)}
+	mset := &Stream{jsa: jsa, config: cfg, srv: s, client: c, consumers: make(map[string]*Consumer), qch: make(chan struct{})}
 
 	jsa.streams[cfg.Name] = mset
 	storeDir := path.Join(jsa.storeDir, streamsDir, cfg.Name)
@@ -224,8 +231,14 @@ func (a *Account) addStream(config *StreamConfig, fsConfig *FileStoreConfig, nod
 	// Setup our internal send go routine.
 	mset.setupSendCapabilities()
 
-	// Set our node.
-	mset.node = node
+	// Set our stream assignment if in clustered mode.
+	if sa != nil {
+		mset.sa = sa
+		// Set our node.
+		mset.node = sa.Group.node
+	}
+
+	// Call directly to set leader if not in clustered mode.
 	if !s.JetStreamIsClustered() {
 		mset.setLeader(true)
 	}
@@ -247,6 +260,7 @@ func (mset *Stream) isLeader() bool {
 	return true
 }
 
+// TODO(dlc) - Check to see if we can accept being the leader or we should should step down.
 func (mset *Stream) setLeader(isLeader bool) {
 	mset.mu.Lock()
 	// If we are here we have a change in leader status.
@@ -258,10 +272,42 @@ func (mset *Stream) setLeader(isLeader bool) {
 			mset.Delete()
 			return
 		}
+		// Make sure we are listening for sync requests.
+		// TODO(dlc) - Original design was that all in sync members of the group would do DQ.
+		mset.startSyncSub()
 	} else {
+		// Stop responding to sync requests.
+		mset.stopSyncSub()
+		// Unsubscribe from direct stream.
 		mset.unsubscribeToStream()
 	}
 	mset.mu.Unlock()
+}
+
+// Lock should be held.
+func (mset *Stream) startSyncSub() {
+	if mset.isClustered() && mset.syncSub == nil {
+		fmt.Printf("[%s] STARTING SYNC SUB - %q\n", mset.srv, mset.sa.Sync)
+		mset.syncSub, _ = mset.srv.sysSubscribe(mset.sa.Sync, mset.handleClusterSyncRequest)
+	}
+}
+
+// Lock should be held.
+func (mset *Stream) stopSyncSub() {
+	if mset.syncSub != nil {
+		fmt.Printf("[%s] STOPPING SYNC SUB\n", mset.srv)
+		mset.srv.sysUnsubscribe(mset.syncSub)
+		mset.syncSub = nil
+	}
+}
+
+// Lock should be held.
+func (mset *Stream) stopReplaySub() {
+	if mset.replaySub != nil {
+		fmt.Printf("[%s] STOPPING SYNC REPLAY SUB\n", mset.srv)
+		mset.srv.sysUnsubscribe(mset.replaySub)
+		mset.replaySub = nil
+	}
 }
 
 // account gets the account for this stream.
@@ -1365,8 +1411,19 @@ func (mset *Stream) stop(delete bool) error {
 		// but should we log?
 		o.stop(delete, false, delete)
 	}
-	n := mset.node
+
 	mset.mu.Lock()
+
+	// Quit channel.
+	close(mset.qch)
+	mset.qch = nil
+
+	// Cluster cleanup
+	if n := mset.node; n != nil {
+		n.Stop()
+		mset.stopSyncSub()
+		mset.stopReplaySub()
+	}
 
 	// Send stream delete advisory after the consumers.
 	if delete {
@@ -1391,6 +1448,8 @@ func (mset *Stream) stop(delete bool) error {
 		mset.ddarr = nil
 		mset.ddmap = nil
 	}
+
+	// Clustered cleanup.
 	mset.mu.Unlock()
 
 	c.closeConnection(ClientClosed)
@@ -1400,9 +1459,6 @@ func (mset *Stream) stop(delete bool) error {
 	}
 
 	if delete {
-		if n != nil {
-			n.Stop()
-		}
 		if err := mset.store.Delete(); err != nil {
 			return err
 		}
@@ -1470,14 +1526,13 @@ func (mset *Stream) LookupConsumer(name string) *Consumer {
 
 // State will return the current state for this stream.
 func (mset *Stream) State() StreamState {
-	mset.mu.Lock()
+	mset.mu.RLock()
 	c := mset.client
-	mset.mu.Unlock()
+	mset.mu.RUnlock()
 	if c == nil {
 		return StreamState{}
 	}
 	// Currently rely on store.
-	// TODO(dlc) - This will need to change with clusters.
 	return mset.store.State()
 }
 
