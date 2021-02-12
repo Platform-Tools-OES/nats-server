@@ -15,6 +15,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -51,6 +52,7 @@ func DefaultMonitorOptions() *Options {
 		ServerName:   "monitor_server",
 		NoLog:        true,
 		NoSigs:       true,
+		Tags:         []string{"tag"},
 	}
 }
 
@@ -243,6 +245,9 @@ func TestHandleVarz(t *testing.T) {
 		}
 		if v.Name != "monitor_server" {
 			t.Fatal("Expected ServerName to be 'monitor_server'")
+		}
+		if !v.Tags.Contains("tag") {
+			t.Fatal("Expected tags to be 'tag'")
 		}
 	}
 
@@ -2089,6 +2094,62 @@ func TestConnzTLSInHandshake(t *testing.T) {
 	}
 }
 
+func TestConnzTLSCfg(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	tc := &TLSConfigOpts{}
+	tc.CertFile = "configs/certs/server.pem"
+	tc.KeyFile = "configs/certs/key.pem"
+
+	var err error
+	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	opts.TLSTimeout = 1.5 // 1.5 seconds
+	opts.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+	opts.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	opts.Gateway.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+	opts.Gateway.TLSTimeout = 1.5
+	opts.LeafNode.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+	opts.LeafNode.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	opts.LeafNode.TLSTimeout = 1.5
+	opts.Cluster.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+	opts.Cluster.TLSTimeout = 1.5
+
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	check := func(verify, required bool, timeout float64) {
+		t.Helper()
+		if !verify {
+			t.Fatalf("Expected tls_verify to be true")
+		}
+		if !required {
+			t.Fatalf("Expected tls_required to be true")
+		}
+		if timeout != 1.5 {
+			t.Fatalf("Expected tls_timeout to be 1.5")
+		}
+	}
+
+	start := time.Now()
+	endpoint := fmt.Sprintf("http://%s:%d/varz", opts.HTTPHost, s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		varz := pollVarz(t, s, mode, endpoint, nil)
+		duration := time.Since(start)
+		if duration >= 1500*time.Millisecond {
+			t.Fatalf("Looks like varz blocked on handshake, took %v", duration)
+		}
+		check(varz.TLSVerify, varz.TLSRequired, varz.TLSTimeout)
+		check(varz.Cluster.TLSVerify, varz.Cluster.TLSRequired, varz.Cluster.TLSTimeout)
+		check(varz.Gateway.TLSVerify, varz.Gateway.TLSRequired, varz.Gateway.TLSTimeout)
+		check(varz.LeafNode.TLSVerify, varz.LeafNode.TLSRequired, varz.LeafNode.TLSTimeout)
+	}
+}
+
 func TestServerIDs(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
@@ -2421,6 +2482,9 @@ func TestMonitorCluster(t *testing.T) {
 		opts.Cluster.Port,
 		opts.Cluster.AuthTimeout,
 		[]string{"127.0.0.1:1234"},
+		opts.Cluster.TLSTimeout,
+		opts.Cluster.TLSConfig != nil,
+		opts.Cluster.TLSConfig != nil,
 	}
 
 	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
@@ -2436,7 +2500,7 @@ func TestMonitorCluster(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in ClusterOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = ClusterOptsVarz{"", "", 0, 0, nil}
+		_ = ClusterOptsVarz{"", "", 0, 0, nil, 2, false, false}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
@@ -2586,6 +2650,8 @@ func TestMonitorGateway(t *testing.T) {
 		opts.Gateway.Port,
 		opts.Gateway.AuthTimeout,
 		opts.Gateway.TLSTimeout,
+		opts.Gateway.TLSConfig != nil,
+		opts.Gateway.TLSConfig != nil,
 		opts.Gateway.Advertise,
 		opts.Gateway.ConnectRetries,
 		[]RemoteGatewayOptsVarz{{"B", 1, nil}},
@@ -2627,7 +2693,7 @@ func TestMonitorGateway(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in GatewayOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = GatewayOptsVarz{"", "", 0, 0, 0, "", 0, []RemoteGatewayOptsVarz{{"", 0, nil}}, false}
+		_ = GatewayOptsVarz{"", "", 0, 0, 0, false, false, "", 0, []RemoteGatewayOptsVarz{{"", 0, nil}}, false}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
@@ -2752,6 +2818,8 @@ func TestMonitorLeafNode(t *testing.T) {
 		opts.LeafNode.Port,
 		opts.LeafNode.AuthTimeout,
 		opts.LeafNode.TLSTimeout,
+		opts.LeafNode.TLSConfig != nil,
+		opts.LeafNode.TLSConfig != nil,
 		[]RemoteLeafOptsVarz{
 			{
 				"acc", 1, []string{"localhost:1234"},
@@ -2773,7 +2841,7 @@ func TestMonitorLeafNode(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in ClusterOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = LeafNodeOptsVarz{"", 0, 0, 0, []RemoteLeafOptsVarz{{"", 0, nil}}}
+		_ = LeafNodeOptsVarz{"", 0, 0, 0, false, false, []RemoteLeafOptsVarz{{"", 0, nil}}}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
@@ -3427,6 +3495,43 @@ func pollLeafz(t *testing.T, s *Server, mode int, url string, opts *LeafzOptions
 	return l
 }
 
+func TestMonitorOpJWT(t *testing.T) {
+	content := `
+	listen: "127.0.0.1:-1"
+	http: "127.0.0.1:-1"
+	operator = "../test/configs/nkeys/op.jwt"
+	resolver = MEMORY
+	`
+	conf := createConfFile(t, []byte(content))
+	defer os.Remove(conf)
+	sa, _ := RunServerWithConfig(conf)
+	defer sa.Shutdown()
+
+	theJWT, err := ioutil.ReadFile("../test/configs/nkeys/op.jwt")
+	require_NoError(t, err)
+	theJWT = []byte(strings.Split(string(theJWT), "\n")[1])
+	claim, err := jwt.DecodeOperatorClaims(string(theJWT))
+	require_NoError(t, err)
+
+	pollURL := fmt.Sprintf("http://127.0.0.1:%d/varz", sa.MonitorAddr().Port)
+	for pollMode := 1; pollMode < 2; pollMode++ {
+		l := pollVarz(t, sa, pollMode, pollURL, nil)
+
+		if len(l.TrustedOperatorsJwt) != 1 {
+			t.Fatalf("Expected one operator jwt")
+		}
+		if len(l.TrustedOperatorsClaim) != 1 {
+			t.Fatalf("Expected one operator claim")
+		}
+		if l.TrustedOperatorsJwt[0] != string(theJWT) {
+			t.Fatalf("Expected operator to be identical to configuration")
+		}
+		if !reflect.DeepEqual(l.TrustedOperatorsClaim[0], claim) {
+			t.Fatal("claims need to be equal")
+		}
+	}
+}
+
 func TestMonitorLeafz(t *testing.T) {
 	content := `
 	listen: "127.0.0.1:-1"
@@ -3678,13 +3783,348 @@ func TestMonitorAccountz(t *testing.T) {
 		t.Fatalf("Body missing value. Contains: %s", body)
 	} else if !strings.Contains(body, `"accounts": [`) {
 		t.Fatalf("Body missing value. Contains: %s", body)
+	} else if !strings.Contains(body, `"system_account": "$SYS"`) {
+		t.Fatalf("Body missing value. Contains: %s", body)
 	}
 	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d/accountz?acc=$SYS", s.MonitorAddr().Port)))
 	if !strings.Contains(body, `"account_detail": {`) {
 		t.Fatalf("Body missing value. Contains: %s", body)
 	} else if !strings.Contains(body, `"account_name": "$SYS",`) {
 		t.Fatalf("Body missing value. Contains: %s", body)
-	} else if !strings.Contains(body, `"subscriptions": 32,`) {
+	} else if !strings.Contains(body, `"subscriptions": 36,`) {
+		t.Fatalf("Body missing value. Contains: %s", body)
+	} else if !strings.Contains(body, `"is_system": true,`) {
+		t.Fatalf("Body missing value. Contains: %s", body)
+	} else if !strings.Contains(body, `"system_account": "$SYS"`) {
 		t.Fatalf("Body missing value. Contains: %s", body)
 	}
+}
+
+func TestMonitorAuthorizedUsers(t *testing.T) {
+	kp, _ := nkeys.FromSeed(seed)
+	usrNKey, _ := kp.PublicKey()
+	opts := DefaultMonitorOptions()
+	opts.Nkeys = []*NkeyUser{{Nkey: string(usrNKey)}}
+	opts.Users = []*User{{Username: "user", Password: "pwd"}}
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	checkAuthUser := func(expected string) {
+		t.Helper()
+		resetPreviousHTTPConnections()
+		url := fmt.Sprintf("http://127.0.0.1:%d/connz?auth=true", s.MonitorAddr().Port)
+		for mode := 0; mode < 2; mode++ {
+			connz := pollConz(t, s, mode, url, &ConnzOptions{Username: true})
+			if l := len(connz.Conns); l != 1 {
+				t.Fatalf("Expected 1, got %v", l)
+			}
+			conn := connz.Conns[0]
+			au := conn.AuthorizedUser
+			if au == _EMPTY_ {
+				t.Fatal("AuthorizedUser is empty!")
+			}
+			if au != expected {
+				t.Fatalf("Expected %q, got %q", expected, au)
+			}
+		}
+	}
+
+	c := natsConnect(t, fmt.Sprintf("nats://user:pwd@127.0.0.1:%d", opts.Port))
+	defer c.Close()
+	checkAuthUser("user")
+	c.Close()
+
+	c = natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", opts.Port),
+		nats.Nkey(usrNKey, func(nonce []byte) ([]byte, error) {
+			return kp.Sign(nonce)
+		}))
+	defer c.Close()
+	// we should get the user's NKey
+	checkAuthUser(usrNKey)
+	c.Close()
+
+	s.Shutdown()
+	opts = DefaultMonitorOptions()
+	opts.Authorization = "sometoken"
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	c = natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", opts.Port),
+		nats.Token("sometoken"))
+	defer c.Close()
+	// We should get the token specified by the user
+	checkAuthUser("sometoken")
+	c.Close()
+	s.Shutdown()
+
+	opts = DefaultMonitorOptions()
+	// User an operator seed
+	kp, _ = nkeys.FromSeed(oSeed)
+	pub, _ := kp.PublicKey()
+	opts.TrustedKeys = []string{pub}
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(apub)
+	ajwt, err := nac.Encode(oKp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	nkp, _ := nkeys.CreateUser()
+	upub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(upub)
+	jwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	buildMemAccResolver(s)
+	addAccountToMemResolver(s, apub, ajwt)
+
+	c = natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", opts.Port),
+		nats.UserJWT(
+			func() (string, error) { return jwt, nil },
+			func(nonce []byte) ([]byte, error) { return nkp.Sign(nonce) }))
+	defer c.Close()
+	// we should get the user's pubkey
+	checkAuthUser(upub)
+}
+
+// Helper function to check that a JS cluster is formed
+func checkForJSClusterUp(t *testing.T, servers ...*Server) {
+	t.Helper()
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		for _, s := range servers {
+			if !s.JetStreamEnabled() {
+				return fmt.Errorf("jetstream not enabled")
+			}
+			if !s.JetStreamIsCurrent() {
+				return fmt.Errorf("jetstream not current")
+			}
+		}
+		return nil
+	})
+}
+
+func TestMonitorJsz(t *testing.T) {
+	readJsInfo := func(url string) *JSInfo {
+		t.Helper()
+		body := readBody(t, url)
+		info := &JSInfo{}
+		err := json.Unmarshal(body, info)
+		require_NoError(t, err)
+		return info
+	}
+	srvs := []*Server{}
+	for _, test := range []struct {
+		port   int
+		mport  int
+		cport  int
+		routed int
+	}{
+		{7500, 7501, 7502, 5502},
+		{5500, 5501, 5502, 7502},
+	} {
+		tmpDir := createDir(t, fmt.Sprintf("srv_%d", test.port))
+		defer os.RemoveAll(tmpDir)
+		cf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:%d
+		http: 127.0.0.1:%d
+		system_account: SYS
+		accounts {
+			SYS {
+				users [{user: sys, password: pwd}]
+			}
+			ACC {
+				users [{user: usr, password: pwd}]
+				jetstream: enabled
+			}
+			BCC_TO_HAVE_ONE_EXTRA {
+				users [{user: usr2, password: pwd}]
+				jetstream: enabled
+			}
+		}
+		jetstream: {
+			max_mem_store: 10Mb
+			max_file_store: 10Mb
+			store_dir: %s
+		}
+		cluster {
+			name: cluster_name
+			listen: 127.0.0.1:%d
+			routes: [nats-route://127.0.0.1:%d]
+		}
+		server_name: server_%d `, test.port, test.mport, tmpDir, test.cport, test.routed, test.port)))
+		defer os.Remove(cf)
+
+		s, _ := RunServerWithConfig(cf)
+		defer s.Shutdown()
+		srvs = append(srvs, s)
+	}
+	checkClusterFormed(t, srvs...)
+	checkForJSClusterUp(t, srvs...)
+
+	nc := natsConnect(t, "nats://usr:pwd@127.0.0.1:7500")
+	defer nc.Close()
+	js, err := nc.JetStream(nats.MaxWait(5 * time.Second))
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "my-stream-replicated",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 2,
+	})
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "my-stream-non-replicated",
+		Subjects: []string{"baz"},
+		Replicas: 1,
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("my-stream-replicated", &nats.ConsumerConfig{
+		Durable:   "my-consumer-replicated",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("my-stream-non-replicated", &nats.ConsumerConfig{
+		Durable:   "my-consumer-non-replicated",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+	nc.Flush()
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+
+	monUrl1 := fmt.Sprintf("http://127.0.0.1:%d/jsz", 7501)
+	monUrl2 := fmt.Sprintf("http://127.0.0.1:%d/jsz", 5501)
+
+	t.Run("default", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url)
+			if len(info.AccountDetails) != 0 {
+				t.Fatalf("expected no account to be returned by %s but got %v", url, info)
+			}
+			if info.StreamCnt == 0 {
+				t.Fatalf("expected stream count to be 2 but got %d", info.StreamCnt)
+			}
+			if info.ConsumerCnt == 0 {
+				t.Fatalf("expected consumer count to be 2 but got %d", info.ConsumerCnt)
+			}
+			if info.MessageCnt != 1 {
+				t.Fatalf("expected one message but got %d", info.MessageCnt)
+			}
+		}
+	})
+	t.Run("accounts", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?accounts=true")
+			if len(info.AccountDetails) != 2 {
+				t.Fatalf("expected both accounts to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("offset-too-big", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?accounts=true&offset=10")
+			if len(info.AccountDetails) != 0 {
+				t.Fatalf("expected no accounts to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("limit", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?accounts=true&limit=1")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected one account to be returned by %s but got %v", url, info)
+			}
+			if info := readJsInfo(url + "?accounts=true&offset=1&limit=1"); len(info.AccountDetails) != 1 {
+				t.Fatalf("expected one account to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("offset-stable", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info1 := readJsInfo(url + "?accounts=true&offset=1&limit=1")
+			if len(info1.AccountDetails) != 1 {
+				t.Fatalf("expected one account to be returned by %s but got %v", url, info1)
+			}
+			info2 := readJsInfo(url + "?accounts=true&offset=1&limit=1")
+			if len(info2.AccountDetails) != 1 {
+				t.Fatalf("expected one account to be returned by %s but got %v", url, info2)
+			}
+			if info1.AccountDetails[0].Name != info2.AccountDetails[0].Name {
+				t.Fatalf("absent changes, same offset should result in same account but gut: %v %v",
+					info1.AccountDetails[0].Name, info2.AccountDetails[0].Name)
+			}
+		}
+	})
+	t.Run("filter-account", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if info.AccountDetails[0].Name != "ACC" {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if len(info.AccountDetails[0].Streams) != 0 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("streams", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC&streams=true")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if len(info.AccountDetails[0].Streams) == 0 {
+				t.Fatalf("expected streams to be returned by %s but got %v", url, info)
+			}
+			if len(info.AccountDetails[0].Streams[0].Consumer) != 0 {
+				t.Fatalf("expected no consumers to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("consumers", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC&consumers=true")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if len(info.AccountDetails[0].Streams[0].Consumer) == 0 {
+				t.Fatalf("expected consumers to be returned by %s but got %v", url, info)
+			}
+			if info.AccountDetails[0].Streams[0].Config != nil {
+				t.Fatal("Config expected to not be present")
+			}
+			if info.AccountDetails[0].Streams[0].Consumer[0].Config != nil {
+				t.Fatal("Config expected to not be present")
+			}
+		}
+	})
+	t.Run("config", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC&consumers=true&config=true")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if info.AccountDetails[0].Streams[0].Config == nil {
+				t.Fatal("Config expected to be present")
+			}
+			if info.AccountDetails[0].Streams[0].Consumer[0].Config == nil {
+				t.Fatal("Config expected to be present")
+			}
+		}
+	})
+	t.Run("account-non-existing", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=DOES_NOT_EXIT")
+			if len(info.AccountDetails) != 0 {
+				t.Fatalf("expected no account to be returned by %s but got %v", url, info)
+			}
+		}
+	})
 }

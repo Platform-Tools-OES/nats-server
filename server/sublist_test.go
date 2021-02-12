@@ -1152,6 +1152,35 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 	s.Remove(sub3)
 	expectFalse()
 
+	if err := s.RegisterNotification("test.node", ch); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	expectOne()
+	expectFalse()
+
+	tnSub1 := newSub("test.node.already.exist")
+	s.Insert(tnSub1)
+	expectNone()
+
+	tnSub2 := newSub("test.node")
+	s.Insert(tnSub2)
+	expectTrue()
+
+	tnSub3 := newSub("test.node")
+	s.Insert(tnSub3)
+	expectNone()
+
+	s.Remove(tnSub1)
+	expectNone()
+	s.Remove(tnSub2)
+	expectNone()
+	s.Remove(tnSub3)
+	expectFalse()
+
+	if !s.ClearNotification("test.node", ch) {
+		t.Fatalf("Expected to return true")
+	}
+
 	sub4 := newSub("bar")
 	s.Insert(sub4)
 	expectTrue()
@@ -1242,6 +1271,47 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 	s.Insert(wcqsub)
 	expectNone()
 
+	if err := s.RegisterNotification("queue.test.node", ch); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	expectOne()
+	expectFalse()
+
+	qsub1 := newQSub("queue.test.node.already.exist", "queue")
+	s.Insert(qsub1)
+	expectNone()
+
+	qsub2 := newQSub("queue.test.node", "queue")
+	s.Insert(qsub2)
+	expectTrue()
+
+	qsub3 := newQSub("queue.test.node", "otherqueue")
+	s.Insert(qsub3)
+	expectNone()
+
+	qsub4 := newQSub("queue.different.node", "queue")
+	s.Insert(qsub4)
+	expectNone()
+
+	qsub5 := newQSub("queue.test.node", "queue")
+	s.Insert(qsub5)
+	expectNone()
+
+	s.Remove(qsub3)
+	expectNone()
+	s.Remove(qsub1)
+	expectNone()
+	s.Remove(qsub2)
+	expectNone()
+	s.Remove(qsub4)
+	expectNone()
+	s.Remove(qsub5)
+	expectFalse()
+
+	if !s.ClearNotification("queue.test.node", ch) {
+		t.Fatalf("Expected to return true")
+	}
+
 	// Test non-blocking notifications.
 	if err := s.RegisterNotification("bar", ch); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -1324,6 +1394,32 @@ func TestSublistReverseMatch(t *testing.T) {
 	verifyMember(r.psubs, fooBarSub, t)
 	verifyMember(r.psubs, fooBazSub, t)
 	verifyMember(r.psubs, fooBarBazSub, t)
+}
+
+func TestSublistMatchWithEmptyTokens(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		cache bool
+	}{
+		{"cache", true},
+		{"no cache", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sl := NewSublist(true)
+			sub1 := newSub(">")
+			sub2 := newQSub(">", "queue")
+			sl.Insert(sub1)
+			sl.Insert(sub2)
+
+			for _, subj := range []string{".foo", "..foo", "foo..", "foo.", "foo..bar", "foo...bar"} {
+				t.Run(subj, func(t *testing.T) {
+					r := sl.Match(subj)
+					verifyLen(r.psubs, 0, t)
+					verifyQLen(r.qsubs, 0, t)
+				})
+			}
+		})
+	}
 }
 
 // -- Benchmarks Setup --

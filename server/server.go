@@ -124,7 +124,6 @@ type Server struct {
 	clients          map[uint64]*client
 	routes           map[uint64]*client
 	routesByHash     sync.Map
-	hash             []byte
 	remotes          map[string]*client
 	leafs            map[uint64]*client
 	users            map[string]*User
@@ -195,6 +194,8 @@ type Server struct {
 
 	// Trusted public operator keys.
 	trustedKeys []string
+	// map of trusted keys to operator setting StrictSigningKeyUsage
+	strictSigningKeyUsage map[string]struct{}
 
 	// We use this to minimize mem copies for requests to monitoring
 	// endpoint /varz (when it comes from http).
@@ -232,6 +233,20 @@ type Server struct {
 	// Holds cluster name under different lock for mapping
 	cnMu sync.RWMutex
 	cn   string
+
+	// For registering raft nodes with the server.
+	rnMu      sync.RWMutex
+	raftNodes map[string]RaftNode
+
+	// For mapping from a raft node name back to a server name and cluster.
+	nodeToInfo sync.Map
+}
+
+type nodeInfo struct {
+	name    string
+	cluster string
+	id      string
+	offline bool
 }
 
 // Make sure all are 64bits for atomic use
@@ -264,7 +279,7 @@ func NewServer(opts *Options) (*Server, error) {
 	pub, _ := kp.PublicKey()
 
 	serverName := pub
-	if opts.ServerName != "" {
+	if opts.ServerName != _EMPTY_ {
 		serverName = opts.ServerName
 	}
 
@@ -322,8 +337,19 @@ func NewServer(opts *Options) (*Server, error) {
 		return nil, fmt.Errorf("Error processing trusted operator keys")
 	}
 
+	if opts.Cluster.Name != _EMPTY_ {
+		// Also place into mapping cn with cnMu lock.
+		s.cnMu.Lock()
+		s.cn = opts.Cluster.Name
+		s.cnMu.Unlock()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Place ourselves in some lookup maps.
+	ourNode := string(getHash(serverName))
+	s.nodeToInfo.Store(ourNode, &nodeInfo{serverName, opts.Cluster.Name, info.ID, false})
 
 	s.routeResolver = opts.Cluster.resolver
 	if s.routeResolver == nil {
@@ -408,6 +434,8 @@ func NewServer(opts *Options) (*Server, error) {
 			if a == nil {
 				sac := NewAccount(s.opts.SystemAccount)
 				sac.Issuer = opts.TrustedOperators[0].Issuer
+				sac.signingKeys = map[string]jwt.Scope{}
+				sac.signingKeys[s.opts.SystemAccount] = nil
 				s.registerAccountNoLock(sac)
 			}
 		}
@@ -540,6 +568,9 @@ func validateOptions(o *Options) error {
 	if err := validateMQTTOptions(o); err != nil {
 		return err
 	}
+	if err := validateJetStreamOptions(o); err != nil {
+		return err
+	}
 	// Finally check websocket options.
 	return validateWebsocketOptions(o)
 }
@@ -594,6 +625,11 @@ func (s *Server) configureAccounts() error {
 		acc.sl = nil
 		acc.clients = nil
 		s.registerAccountNoLock(a)
+
+		// If we see an account defined using $SYS we will make sure that is set as system account.
+		if acc.Name == DEFAULT_SYSTEM_ACCOUNT && opts.SystemAccount == _EMPTY_ {
+			s.opts.SystemAccount = DEFAULT_SYSTEM_ACCOUNT
+		}
 	}
 
 	// Now that we have this we need to remap any referenced accounts in
@@ -607,7 +643,9 @@ func (s *Server) configureAccounts() error {
 			ea.approved[sub] = acc
 		}
 	}
+	var numAccounts int
 	s.accounts.Range(func(k, v interface{}) bool {
+		numAccounts++
 		acc := v.(*Account)
 		// Exports
 		for _, se := range acc.exports.streams {
@@ -665,6 +703,22 @@ func (s *Server) configureAccounts() error {
 		}
 		if err != nil {
 			return fmt.Errorf("error resolving system account: %v", err)
+		}
+
+		// If we have defined a system account here check to see if its just us and the $G account.
+		// We would do this to add user/pass to the system account. If this is the case add in
+		// no-auth-user for $G.
+		if numAccounts == 2 && s.opts.NoAuthUser == _EMPTY_ {
+			// Create a unique name so we do not collide.
+			var b [8]byte
+			rn := rand.Int63()
+			for i, l := 0, rn; i < len(b); i++ {
+				b[i] = digits[l%base]
+				l /= base
+			}
+			uname := fmt.Sprintf("nats-%s", b[:])
+			s.opts.Users = append(s.opts.Users, &User{Username: uname, Password: string(b[:]), Account: s.gacc})
+			s.opts.NoAuthUser = uname
 		}
 	}
 
@@ -734,7 +788,7 @@ func (s *Server) generateRouteInfoJSON() {
 func (s *Server) globalAccountOnly() bool {
 	var hasOthers bool
 
-	if len(s.trustedKeys) > 0 {
+	if s.trustedKeys != nil {
 		return false
 	}
 
@@ -759,13 +813,29 @@ func (s *Server) standAloneMode() bool {
 	return opts.Cluster.Port == 0 && opts.LeafNode.Port == 0 && opts.Gateway.Port == 0
 }
 
+func (s *Server) configuredRoutes() int {
+	return len(s.getOpts().Routes)
+}
+
+// activePeers is used in bootstrapping raft groups like the JetStream meta controller.
+func (s *Server) ActivePeers() (peers []string) {
+	s.nodeToInfo.Range(func(k, v interface{}) bool {
+		si := v.(*nodeInfo)
+		if !si.offline {
+			peers = append(peers, k.(string))
+		}
+		return true
+	})
+	return peers
+}
+
 // isTrustedIssuer will check that the issuer is a trusted public key.
 // This is used to make sure an account was signed by a trusted operator.
 func (s *Server) isTrustedIssuer(issuer string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// If we are not running in trusted mode and there is no issuer, that is ok.
-	if len(s.trustedKeys) == 0 && issuer == "" {
+	if s.trustedKeys == nil && issuer == "" {
 		return true
 	}
 	for _, tk := range s.trustedKeys {
@@ -779,6 +849,7 @@ func (s *Server) isTrustedIssuer(issuer string) bool {
 // processTrustedKeys will process binary stamped and
 // options-based trusted nkeys. Returns success.
 func (s *Server) processTrustedKeys() bool {
+	s.strictSigningKeyUsage = map[string]struct{}{}
 	if trustedKeys != "" && !s.initStampedTrustedKeys() {
 		return false
 	} else if s.opts.TrustedKeys != nil {
@@ -787,7 +858,15 @@ func (s *Server) processTrustedKeys() bool {
 				return false
 			}
 		}
-		s.trustedKeys = s.opts.TrustedKeys
+		s.trustedKeys = append([]string(nil), s.opts.TrustedKeys...)
+		for _, claim := range s.opts.TrustedOperators {
+			if !claim.StrictSigningKeyUsage {
+				continue
+			}
+			for _, key := range claim.SigningKeys {
+				s.strictSigningKeyUsage[key] = struct{}{}
+			}
+		}
 	}
 	return true
 }
@@ -853,6 +932,11 @@ func ProcessCommandLineArgs(cmd *flag.FlagSet) (showVersion bool, showHelp bool,
 	}
 
 	return false, false, nil
+}
+
+// Public version.
+func (s *Server) Running() bool {
+	return s.isRunning()
 }
 
 // Protected check on running state
@@ -1039,6 +1123,7 @@ func (s *Server) setSystemAccount(acc *Account) error {
 		orphMax: 5 * eventsHBInterval,
 		chkOrph: 3 * eventsHBInterval,
 	}
+
 	s.sys.wg.Add(1)
 	s.mu.Unlock()
 
@@ -1328,9 +1413,11 @@ func (s *Server) fetchAccount(name string) (*Account, error) {
 	}
 	// The sub imports may have been setup but will not have had their
 	// subscriptions properly setup. Do that here.
-	if len(acc.imports.services) > 0 && acc.ic == nil {
-		acc.ic = s.createInternalAccountClient()
-		acc.ic.acc = acc
+	if len(acc.imports.services) > 0 {
+		if acc.ic == nil {
+			acc.ic = s.createInternalAccountClient()
+			acc.ic.acc = acc
+		}
 		acc.addAllServiceImportSubs()
 	}
 	return acc, nil
@@ -1339,13 +1426,23 @@ func (s *Server) fetchAccount(name string) (*Account, error) {
 // Start up the server, this will block.
 // Start via a Go routine if needed.
 func (s *Server) Start() {
-	s.Noticef("Starting nats-server version %s", VERSION)
-	s.Debugf("Go build version %s", s.info.GoVersion)
+	s.Noticef("Starting nats-server")
+
 	gc := gitCommit
 	if gc == "" {
 		gc = "not set"
 	}
-	s.Noticef("Git commit [%s]", gc)
+
+	s.Noticef("  Version:  %s", VERSION)
+	s.Noticef("  Git:      [%s]", gc)
+	s.Debugf("  Go build: %s", s.info.GoVersion)
+	s.Noticef("  Name:     %s", s.info.Name)
+	if s.sys != nil {
+		s.Noticef("  Node:     %s", s.sys.shash)
+	}
+	s.Noticef("  ID:       %s", s.info.ID)
+
+	defer s.Noticef("Server is ready")
 
 	// Check for insecure configurations.
 	s.checkAuthforWarnings()
@@ -1463,16 +1560,15 @@ func (s *Server) Start() {
 			return
 		}
 	} else {
-		// Check to see if any configured accounts have JetStream enabled
-		// and warn if they do.
+		// Check to see if any configured accounts have JetStream enabled.
 		s.accounts.Range(func(k, v interface{}) bool {
 			acc := v.(*Account)
 			acc.mu.RLock()
 			hasJs := acc.jsLimits != nil
-			name := acc.Name
 			acc.mu.RUnlock()
 			if hasJs {
-				s.Warnf("Account [%q] has JetStream configuration but JetStream not enabled", name)
+				s.checkJetStreamExports()
+				acc.enableAllJetStreamServiceImports()
 			}
 			return true
 		})
@@ -1489,6 +1585,13 @@ func (s *Server) Start() {
 	// be sent to other routes.
 	if opts.Gateway.Port != 0 {
 		s.startGateways()
+	}
+
+	// Start websocket server if needed. Do this before starting the routes, and
+	// leaf node because we want to resolve the gateway host:port so that this
+	// information can be sent to other routes.
+	if opts.Websocket.Port != 0 {
+		s.startWebsocketServer()
 	}
 
 	// Start up listen if we want to accept leaf node connections.
@@ -1515,13 +1618,6 @@ func (s *Server) Start() {
 	// The Routing routine needs to wait for the client listen
 	// port to be opened and potential ephemeral port selected.
 	clientListenReady := make(chan struct{})
-
-	// Start websocket server if needed. Do this before starting the routes,
-	// because we want to resolve the gateway host:port so that this information
-	// can be sent to other routes.
-	if opts.Websocket.Port != 0 {
-		s.startWebsocketServer()
-	}
 
 	// MQTT
 	if opts.MQTT.Port != 0 {
@@ -1551,6 +1647,9 @@ func (s *Server) Start() {
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
 // and closing all associated clients.
 func (s *Server) Shutdown() {
+	// Transfer off any raft nodes that we are a leader.
+	s.transferRaftLeaders()
+
 	// Shutdown the eventing system as needed.
 	// This is done first to send out any messages for
 	// account status. We will also clean up any
@@ -1727,6 +1826,7 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 		s.mu.Unlock()
 		return
 	}
+
 	hp := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
 	l, e := natsListen("tcp", hp)
 	if e != nil {
@@ -1741,10 +1841,6 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 	if opts.TLSConfig != nil {
 		s.Noticef("TLS required for client connections")
 	}
-
-	s.Noticef("Server id is %s", s.info.ID)
-	s.Noticef("Server name is %s", s.info.Name)
-	s.Noticef("Server is ready")
 
 	// If server was started with RANDOM_PORT (-1), opts.Port would be equal
 	// to 0 at the beginning this function. So we need to get the actual port
@@ -1932,6 +2028,7 @@ const (
 	SubszPath    = "/subsz"
 	StackszPath  = "/stacksz"
 	AccountzPath = "/accountz"
+	JszPath      = "/jsz"
 )
 
 func (s *Server) basePath(p string) string {
@@ -2011,7 +2108,8 @@ func (s *Server) startMonitoring(secure bool) error {
 	mux.HandleFunc(s.basePath(StackszPath), s.HandleStacksz)
 	// Accountz
 	mux.HandleFunc(s.basePath(AccountzPath), s.HandleAccountz)
-
+	// Jsz
+	mux.HandleFunc(s.basePath(JszPath), s.HandleJsz)
 	// Do not set a WriteTimeout because it could cause cURL/browser
 	// to return empty response or unable to display page if the
 	// server needs more time to build the response.
@@ -2201,40 +2299,17 @@ func (s *Server) createClient(conn net.Conn) *client {
 
 	// Check for TLS
 	if !isClosed && tlsRequired {
-		c.Debugf("Starting TLS client connection handshake")
 		// If we have a prebuffer create a multi-reader.
 		if len(pre) > 0 {
 			c.nc = &tlsMixConn{c.nc, bytes.NewBuffer(pre)}
 			// Clear pre so it is not parsed.
 			pre = nil
 		}
-
-		c.nc = tls.Server(c.nc, opts.TLSConfig)
-		conn := c.nc.(*tls.Conn)
-
-		// Setup the timeout
-		ttl := secondsToDuration(opts.TLSTimeout)
-		time.AfterFunc(ttl, func() { tlsTimeout(c, conn) })
-		conn.SetReadDeadline(time.Now().Add(ttl))
-
-		// Force handshake
-		c.mu.Unlock()
-		if err := conn.Handshake(); err != nil {
-			c.Errorf("TLS handshake error: %v", err)
-			c.closeConnection(TLSHandshakeError)
+		// Performs server-side TLS handshake.
+		if err := c.doTLSServerHandshake(_EMPTY_, opts.TLSConfig, opts.TLSTimeout); err != nil {
+			c.mu.Unlock()
 			return nil
 		}
-		// Reset the read deadline
-		conn.SetReadDeadline(time.Time{})
-
-		// Re-Grab lock
-		c.mu.Lock()
-
-		// Indicate that handshake is complete (used in monitoring)
-		c.flags.set(handshakeComplete)
-
-		// The connection may have been closed
-		isClosed = c.isClosed()
 	}
 
 	// If connection is marked as closed, bail out.
@@ -2303,6 +2378,10 @@ func (s *Server) saveClosedClient(c *client, nc net.Conn, reason ClosedState) {
 	if c.acc != nil && c.acc.Name != globalAccountName {
 		cc.acc = c.acc.Name
 	}
+	cc.JWT = c.opts.JWT
+	cc.IssuerKey = issuerForClient(c)
+	cc.Tags = c.tags
+	cc.NameTag = c.nameTag
 	c.mu.Unlock()
 
 	// Place in the ring buffer
@@ -2622,15 +2701,20 @@ func (s *Server) supportsHeaders() bool {
 
 // ID returns the server's ID
 func (s *Server) ID() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.info.ID
+}
+
+// NodeName returns the node name for this server.
+func (s *Server) NodeName() string {
+	return string(getHash(s.info.Name))
 }
 
 // Name returns the server's name. This will be the same as the ID if it was not set.
 func (s *Server) Name() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.info.Name
+}
+
+func (s *Server) String() string {
 	return s.info.Name
 }
 
@@ -2853,9 +2937,9 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 		}
 
 		if wsListener != nil {
-			protocol := "ws"
+			protocol := wsSchemePrefix
 			if wss {
-				protocol = "wss"
+				protocol = wsSchemePrefixTLS
 			}
 			ports.WebSocket = formatURL(protocol, wsListener)
 		}
@@ -3006,6 +3090,16 @@ func (s *Server) lameDuckMode() {
 		gp *= -1
 	}
 	s.mu.Unlock()
+
+	// If we are running any raftNodes transfer leaders.
+	if hadTransfers := s.transferRaftLeaders(); hadTransfers {
+		// They will tranfer leadership quickly, but wait here for a second.
+		select {
+		case <-time.After(time.Second):
+		case <-s.quitCh:
+			return
+		}
+	}
 
 	// Wait for accept loops to be done to make sure that no new
 	// client can connect

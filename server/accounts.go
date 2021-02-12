@@ -1,4 +1,4 @@
-// Copyright 2018-2020 The NATS Authors
+// Copyright 2018-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,7 +23,6 @@ import (
 	"math/rand"
 	"net/http"
 	"net/textproto"
-	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
@@ -74,7 +73,7 @@ type Account struct {
 	limits
 	expired      bool
 	incomplete   bool
-	signingKeys  []string
+	signingKeys  map[string]jwt.Scope
 	srv          *Server // server this account is registered with (possibly nil)
 	lds          string  // loop detection subject for leaf nodes
 	siReply      []byte  // service reply prefix, will form wildcard subscription.
@@ -82,6 +81,8 @@ type Account struct {
 	eventIds     *nuid.NUID
 	eventIdsMu   sync.Mutex
 	defaultPerms *Permissions
+	tags         jwt.TagList
+	nameTag      string
 }
 
 // Account based limits.
@@ -110,6 +111,8 @@ type streamImport struct {
 	invalid bool
 }
 
+const ClientInfoHdr = "Nats-Request-Info"
+
 // Import service mapping struct
 type serviceImport struct {
 	acc         *Account
@@ -130,7 +133,6 @@ type serviceImport struct {
 	share       bool
 	tracking    bool
 	didDeliver  bool
-	isSysAcc    bool
 	trackingHdr http.Header // header from request
 }
 
@@ -169,8 +171,9 @@ func (rt ServiceRespType) String() string {
 // exportAuth holds configured approvals or boolean indicating an
 // auth token is required for import.
 type exportAuth struct {
-	tokenReq bool
-	approved map[string]*Account
+	tokenReq   bool
+	accountPos uint
+	approved   map[string]*Account
 }
 
 // streamExport
@@ -217,6 +220,10 @@ func NewAccount(name string) *Account {
 		eventIds: nuid.New(),
 	}
 	return a
+}
+
+func (a *Account) String() string {
+	return a.Name
 }
 
 // Used to create shallow copies of accounts for transfer
@@ -499,9 +506,9 @@ func (a *Account) TotalSubs() int {
 
 // MapDest is for mapping published subjects for clients.
 type MapDest struct {
-	Subject    string `json:"subject"`
-	Weight     uint8  `json:"weight"`
-	OptCluster string `json:"cluster,omitempty"`
+	Subject string `json:"subject"`
+	Weight  uint8  `json:"weight"`
+	Cluster string `json:"cluster,omitempty"`
 }
 
 func NewMapDest(subject string, weight uint8) *MapDest {
@@ -566,16 +573,16 @@ func (a *Account) AddWeightedMappings(src string, dests ...*MapDest) error {
 		if err != nil {
 			return err
 		}
-		if d.OptCluster == "" {
+		if d.Cluster == "" {
 			m.dests = append(m.dests, &destination{tr, d.Weight})
 		} else {
 			// We have a cluster scoped filter.
 			if m.cdests == nil {
 				m.cdests = make(map[string][]*destination)
 			}
-			ad := m.cdests[d.OptCluster]
+			ad := m.cdests[d.Cluster]
 			ad = append(ad, &destination{tr, d.Weight})
-			m.cdests[d.OptCluster] = ad
+			m.cdests[d.Cluster] = ad
 		}
 	}
 
@@ -871,24 +878,49 @@ func (a *Account) removeClient(c *client) int {
 	return n
 }
 
-func (a *Account) randomClient() *client {
-	if a.ic != nil {
-		return a.ic
+func setExportAuth(ea *exportAuth, subject string, accounts []*Account, accountPos uint) error {
+	if accountPos > 0 {
+		token := strings.Split(subject, ".")
+		if len(token) < int(accountPos) || token[accountPos-1] != "*" {
+			return ErrInvalidSubject
+		}
 	}
-	var c *client
-	for c = range a.clients {
-		break
+	ea.accountPos = accountPos
+	// empty means auth required but will be import token.
+	if accounts == nil {
+		return nil
 	}
-	return c
+	if len(accounts) == 0 {
+		ea.tokenReq = true
+		return nil
+	}
+	if ea.approved == nil {
+		ea.approved = make(map[string]*Account, len(accounts))
+	}
+	for _, acc := range accounts {
+		ea.approved[acc.Name] = acc
+	}
+	return nil
 }
 
 // AddServiceExport will configure the account with the defined export.
 func (a *Account) AddServiceExport(subject string, accounts []*Account) error {
-	return a.AddServiceExportWithResponse(subject, Singleton, accounts)
+	return a.addServiceExportWithResponseAndAccountPos(subject, Singleton, accounts, 0)
+}
+
+// AddServiceExport will configure the account with the defined export.
+func (a *Account) addServiceExportWithAccountPos(subject string, accounts []*Account, accountPos uint) error {
+	return a.addServiceExportWithResponseAndAccountPos(subject, Singleton, accounts, accountPos)
 }
 
 // AddServiceExportWithResponse will configure the account with the defined export and response type.
 func (a *Account) AddServiceExportWithResponse(subject string, respType ServiceRespType, accounts []*Account) error {
+	return a.addServiceExportWithResponseAndAccountPos(subject, respType, accounts, 0)
+}
+
+// AddServiceExportWithresponse will configure the account with the defined export and response type.
+func (a *Account) addServiceExportWithResponseAndAccountPos(
+	subject string, respType ServiceRespType, accounts []*Account, accountPos uint) error {
 	if a == nil {
 		return ErrMissingAccount
 	}
@@ -910,17 +942,12 @@ func (a *Account) AddServiceExportWithResponse(subject string, respType ServiceR
 		se.respType = respType
 	}
 
-	if accounts != nil {
-		// empty means auth required but will be import token.
-		if len(accounts) == 0 {
-			se.tokenReq = true
-		} else {
-			if se.approved == nil {
-				se.approved = make(map[string]*Account, len(accounts))
-			}
-			for _, acc := range accounts {
-				se.approved[acc.Name] = acc
-			}
+	if accounts != nil || accountPos > 0 {
+		if se == nil {
+			se = &serviceExport{}
+		}
+		if err := setExportAuth(&se.exportAuth, subject, accounts, accountPos); err != nil {
+			return err
 		}
 	}
 	lrt := a.lowestServiceExportResponseTime()
@@ -1096,11 +1123,10 @@ func (a *Account) IsExportServiceTracking(service string) bool {
 // designate to share the additional information in the service import.
 type ServiceLatency struct {
 	TypedEvent
-
 	Status         int           `json:"status"`
 	Error          string        `json:"description,omitempty"`
-	Requestor      LatencyClient `json:"requestor,omitempty"`
-	Responder      LatencyClient `json:"responder,omitempty"`
+	Requestor      *ClientInfo   `json:"requestor,omitempty"`
+	Responder      *ClientInfo   `json:"responder,omitempty"`
 	RequestHeader  http.Header   `json:"header,omitempty"` // only contains header(s) triggering the measurement
 	RequestStart   time.Time     `json:"start"`
 	ServiceLatency time.Duration `json:"service"`
@@ -1110,23 +1136,6 @@ type ServiceLatency struct {
 
 // ServiceLatencyType is the NATS Event Type for ServiceLatency
 const ServiceLatencyType = "io.nats.server.metric.v1.service_latency"
-
-// LatencyClient is the JSON message structure assigned to requestors and responders.
-// Note that for a requestor, the only information shared by default is the RTT used
-// to calculate the total latency. The requestor's account can designate to share
-// the additional information in the service import.
-type LatencyClient struct {
-	Account string        `json:"acc"`
-	RTT     time.Duration `json:"rtt"`
-	Start   time.Time     `json:"start,omitempty"`
-	User    string        `json:"user,omitempty"`
-	Name    string        `json:"name,omitempty"`
-	Lang    string        `json:"lang,omitempty"`
-	Version string        `json:"ver,omitempty"`
-	IP      string        `json:"ip,omitempty"`
-	CID     uint64        `json:"cid,omitempty"`
-	Server  string        `json:"server,omitempty"`
-}
 
 // NATSTotalTime is a helper function that totals the NATS latencies.
 func (nl *ServiceLatency) NATSTotalTime() time.Duration {
@@ -1225,7 +1234,11 @@ func (a *Account) sendBackendErrorTrackingLatency(si *serviceImport, reason rsiR
 	if rc != nil {
 		sl.Requestor = rc.getClientInfo(share)
 	}
-	sl.RequestStart = time.Unix(0, ts-int64(sl.Requestor.RTT)).UTC()
+	var reqRTT time.Duration
+	if sl.Requestor != nil {
+		reqRTT = sl.Requestor.RTT
+	}
+	sl.RequestStart = time.Unix(0, ts-int64(reqRTT)).UTC()
 	if reason == rsiNoDelivery {
 		sl.Status = 503
 		sl.Error = "Service Unavailable"
@@ -1254,10 +1267,17 @@ func (a *Account) sendTrackingLatency(si *serviceImport, responder *client) bool
 		Requestor: requestor.getClientInfo(si.share),
 		Responder: responder.getClientInfo(true),
 	}
-	sl.RequestStart = time.Unix(0, si.ts-int64(sl.Requestor.RTT)).UTC()
-	sl.ServiceLatency = serviceRTT - sl.Responder.RTT
+	var respRTT, reqRTT time.Duration
+	if sl.Responder != nil {
+		respRTT = sl.Responder.RTT
+	}
+	if sl.Requestor != nil {
+		reqRTT = sl.Requestor.RTT
+	}
+	sl.RequestStart = time.Unix(0, si.ts-int64(reqRTT)).UTC()
+	sl.ServiceLatency = serviceRTT - respRTT
 	sl.TotalLatency = sl.Requestor.RTT + serviceRTT
-	if sl.Responder.RTT > 0 {
+	if respRTT > 0 {
 		sl.SystemLatency = time.Since(ts)
 		sl.TotalLatency += sl.SystemLatency
 	}
@@ -1350,6 +1370,7 @@ func (a *Account) AddServiceImportWithClaim(destination *Account, from, to strin
 	}
 
 	_, err := a.addServiceImport(destination, from, to, imClaim)
+
 	return err
 }
 
@@ -1679,8 +1700,8 @@ func (a *Account) serviceImportExists(dest *Account, from string) bool {
 }
 
 // Add a service import.
-// This does no checks and should only be called by the msg processing code. Use
-// AddServiceImport from above if responding to user input or config changes, etc.
+// This does no checks and should only be called by the msg processing code.
+// Use AddServiceImport from above if responding to user input or config changes, etc.
 func (a *Account) addServiceImport(dest *Account, from, to string, claim *jwt.Import) (*serviceImport, error) {
 	rt := Singleton
 	var lat *serviceLatency
@@ -1695,6 +1716,7 @@ func (a *Account) addServiceImport(dest *Account, from, to string, claim *jwt.Im
 	dest.mu.RUnlock()
 
 	// Track if this maps us to the system account.
+	// We will always share information with them.
 	var isSysAcc bool
 	if s != nil {
 		s.mu.Lock()
@@ -1740,11 +1762,12 @@ func (a *Account) addServiceImport(dest *Account, from, to string, claim *jwt.Im
 			}
 		}
 	}
-	share := false
+	// Turn on sharing by default if importing from system services.
+	share := isSysAcc
 	if claim != nil {
 		share = claim.Share
 	}
-	si := &serviceImport{dest, claim, se, nil, from, to, tr, 0, rt, lat, nil, nil, usePub, false, false, share, false, false, isSysAcc, nil}
+	si := &serviceImport{dest, claim, se, nil, from, to, tr, 0, rt, lat, nil, nil, usePub, false, false, share, false, false, nil}
 	a.imports.services[from] = si
 	a.mu.Unlock()
 
@@ -1804,6 +1827,7 @@ func (a *Account) addServiceImportSub(si *serviceImport) error {
 		c.processServiceImport(si, a, msg)
 	}
 	_, err := c.processSub([]byte(subject), nil, []byte(sid), cb, true)
+
 	return err
 }
 
@@ -2003,7 +2027,9 @@ func (a *Account) createRespWildcard() []byte {
 	a.mu.Unlock()
 
 	// Create subscription and internal callback for all the wildcard response subjects.
-	c.processSub(wcsub, nil, []byte(sid), a.processServiceImportResponse, false)
+	if sub, err := c.processSub(wcsub, nil, []byte(sid), a.processServiceImportResponse, false); err == nil {
+		sub.rsi = true
+	}
 
 	return pre
 }
@@ -2159,7 +2185,7 @@ func (a *Account) addRespServiceImport(dest *Account, to string, osi *serviceImp
 
 	// dest is the requestor's account. a is the service responder with the export.
 	// Marked as internal here, that is how we distinguish.
-	si := &serviceImport{dest, nil, osi.se, nil, nrr, to, nil, 0, rt, nil, nil, nil, false, true, false, osi.share, false, false, false, nil}
+	si := &serviceImport{dest, nil, osi.se, nil, nrr, to, nil, 0, rt, nil, nil, nil, false, true, false, osi.share, false, false, nil}
 
 	if a.exports.responses == nil {
 		a.exports.responses = make(map[string]*serviceImport)
@@ -2288,8 +2314,16 @@ func (a *Account) AddStreamImport(account *Account, from, prefix string) error {
 var IsPublicExport = []*Account(nil)
 
 // AddStreamExport will add an export to the account. If accounts is nil
-// it will signify a public export, meaning anyone can impoort.
+// it will signify a public export, meaning anyone can import.
 func (a *Account) AddStreamExport(subject string, accounts []*Account) error {
+	return a.addStreamExportWithAccountPos(subject, accounts, 0)
+}
+
+// AddStreamExport will add an export to the account. If accounts is nil
+// it will signify a public export, meaning anyone can import.
+// if accountPos is > 0, all imports will be granted where the following holds:
+// strings.Split(subject, ".")[accountPos] == account id will be granted.
+func (a *Account) addStreamExportWithAccountPos(subject string, accounts []*Account, accountPos uint) error {
 	if a == nil {
 		return ErrMissingAccount
 	}
@@ -2301,20 +2335,12 @@ func (a *Account) AddStreamExport(subject string, accounts []*Account) error {
 		a.exports.streams = make(map[string]*streamExport)
 	}
 	ea := a.exports.streams[subject]
-	if accounts != nil {
+	if accounts != nil || accountPos > 0 {
 		if ea == nil {
 			ea = &streamExport{}
 		}
-		// empty means auth required but will be import token.
-		if len(accounts) == 0 {
-			ea.tokenReq = true
-		} else {
-			if ea.approved == nil {
-				ea.approved = make(map[string]*Account, len(accounts))
-			}
-			for _, acc := range accounts {
-				ea.approved[acc.Name] = acc
-			}
+		if err := setExportAuth(&ea.exportAuth, subject, accounts, accountPos); err != nil {
+			return err
 		}
 	}
 	a.exports.streams[subject] = ea
@@ -2337,14 +2363,21 @@ func (a *Account) checkStreamImportAuthorizedNoLock(account *Account, subject st
 	return a.checkStreamExportApproved(account, subject, imClaim)
 }
 
-func (a *Account) checkAuth(ea *exportAuth, account *Account, imClaim *jwt.Import) bool {
+func (a *Account) checkAuth(ea *exportAuth, account *Account, imClaim *jwt.Import, tokens []string) bool {
 	// if ea is nil or ea.approved is nil, that denotes a public export
-	if ea == nil || (ea.approved == nil && !ea.tokenReq) {
+	if ea == nil || (ea.approved == nil && !ea.tokenReq && ea.accountPos == 0) {
 		return true
+	}
+	// Check if the export is protected and enforces presence of importing account identity
+	if ea.accountPos > 0 {
+		return ea.accountPos <= uint(len(tokens)) && tokens[ea.accountPos-1] == account.Name
 	}
 	// Check if token required
 	if ea.tokenReq {
 		return a.checkActivation(account, imClaim, true)
+	}
+	if ea.approved == nil {
+		return false
 	}
 	// If we have a matching account we are authorized
 	_, ok := ea.approved[account.Name]
@@ -2355,10 +2388,11 @@ func (a *Account) checkStreamExportApproved(account *Account, subject string, im
 	// Check direct match of subject first
 	ea, ok := a.exports.streams[subject]
 	if ok {
+		// if ea is nil or eq.approved is nil, that denotes a public export
 		if ea == nil {
 			return true
 		}
-		return a.checkAuth(&ea.exportAuth, account, imClaim)
+		return a.checkAuth(&ea.exportAuth, account, imClaim, nil)
 	}
 	// ok if we are here we did not match directly so we need to test each one.
 	// The import subject arg has to take precedence, meaning the export
@@ -2370,7 +2404,7 @@ func (a *Account) checkStreamExportApproved(account *Account, subject string, im
 			if ea == nil {
 				return true
 			}
-			return a.checkAuth(&ea.exportAuth, account, imClaim)
+			return a.checkAuth(&ea.exportAuth, account, imClaim, tokens)
 		}
 	}
 	return false
@@ -2380,17 +2414,11 @@ func (a *Account) checkServiceExportApproved(account *Account, subject string, i
 	// Check direct match of subject first
 	se, ok := a.exports.services[subject]
 	if ok {
-		// if se is nil or eq.approved is nil, that denotes a public export
-		if se == nil || (se.approved == nil && !se.tokenReq) {
+		// if ea is nil or eq.approved is nil, that denotes a public export
+		if se == nil {
 			return true
 		}
-		// Check if token required
-		if se.tokenReq {
-			return a.checkActivation(account, imClaim, true)
-		}
-		// If we have a matching account we are authorized
-		_, ok := se.approved[account.Name]
-		return ok
+		return a.checkAuth(&se.exportAuth, account, imClaim, nil)
 	}
 	// ok if we are here we did not match directly so we need to test each one.
 	// The import subject arg has to take precedence, meaning the export
@@ -2399,15 +2427,10 @@ func (a *Account) checkServiceExportApproved(account *Account, subject string, i
 	tokens := strings.Split(subject, tsep)
 	for subj, se := range a.exports.services {
 		if isSubsetMatch(tokens, subj) {
-			if se == nil || (se.approved == nil && !se.tokenReq) {
+			if se == nil {
 				return true
 			}
-			// Check if token required
-			if se.tokenReq {
-				return a.checkActivation(account, imClaim, true)
-			}
-			_, ok := se.approved[account.Name]
-			return ok
+			return a.checkAuth(&se.exportAuth, account, imClaim, tokens)
 		}
 	}
 	return false
@@ -2435,22 +2458,6 @@ func (a *Account) getWildcardServiceExport(from string) *serviceExport {
 		}
 	}
 	return nil
-}
-
-// Will fetch the activation token for an import.
-func fetchActivation(url string) string {
-	// FIXME(dlc) - Make configurable.
-	c := &http.Client{Timeout: 2 * time.Second}
-	resp, err := c.Get(url)
-	if err != nil || resp == nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return ""
-	}
-	return string(body)
 }
 
 // These are import stream specific versions for when an activation expires.
@@ -2544,10 +2551,6 @@ func (a *Account) checkActivation(importAcc *Account, claim *jwt.Import, expTime
 	// Create a quick clone so we can inline Token JWT.
 	clone := *claim
 
-	// We grab the token from a URL by hand here since we need expiration etc.
-	if url, err := url.Parse(clone.Token); err == nil && url.Scheme != "" {
-		clone.Token = fetchActivation(url.String())
-	}
 	vr := jwt.CreateValidationResults()
 	clone.Validate(importAcc.Name, vr)
 	if vr.IsBlocking(true) {
@@ -2596,7 +2599,8 @@ func (a *Account) isIssuerClaimTrusted(claims *jwt.ActivationClaims) bool {
 		}
 		return false
 	}
-	return a.hasIssuerNoLock(claims.Issuer)
+	_, ok := a.hasIssuerNoLock(claims.Issuer)
+	return ok
 }
 
 // Returns true if `a` and `b` stream imports are the same. Note that the
@@ -2742,26 +2746,19 @@ func (a *Account) checkExpiration(claims *jwt.ClaimsData) {
 }
 
 // hasIssuer returns true if the issuer matches the account
+// If the issuer is a scoped signing key, the scope will be returned as well
 // issuer or it is a signing key for the account.
-func (a *Account) hasIssuer(issuer string) bool {
+func (a *Account) hasIssuer(issuer string) (jwt.Scope, bool) {
 	a.mu.RLock()
-	hi := a.hasIssuerNoLock(issuer)
+	scope, ok := a.hasIssuerNoLock(issuer)
 	a.mu.RUnlock()
-	return hi
+	return scope, ok
 }
 
 // hasIssuerNoLock is the unlocked version of hasIssuer
-func (a *Account) hasIssuerNoLock(issuer string) bool {
-	// same issuer -- keep this for safety on the calling code
-	if a.Name == issuer {
-		return true
-	}
-	for i := 0; i < len(a.signingKeys); i++ {
-		if a.signingKeys[i] == issuer {
-			return true
-		}
-	}
-	return false
+func (a *Account) hasIssuerNoLock(issuer string) (jwt.Scope, bool) {
+	scope, ok := a.signingKeys[issuer]
+	return scope, ok
 }
 
 // Returns the loop detection subject used for leafnodes
@@ -2825,6 +2822,10 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 	// Clone to update, only select certain fields.
 	old := &Account{Name: a.Name, exports: a.exports, limits: a.limits, signingKeys: a.signingKeys}
 
+	// overwrite claim meta data
+	a.nameTag = ac.Name
+	a.tags = ac.Tags
+
 	// Reset exports and imports here.
 
 	// Exports is creating a whole new map.
@@ -2846,24 +2847,57 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 	// Reset any notion of export revocations.
 	a.actsRevoked = nil
 
+	alteredScope := map[string]struct{}{}
+
 	// update account signing keys
 	a.signingKeys = nil
-	signersChanged := false
-	for k := range ac.SigningKeys {
-		a.signingKeys = append(a.signingKeys, k)
+	_, strict := s.strictSigningKeyUsage[a.Issuer]
+	if len(ac.SigningKeys) > 0 || !strict {
+		a.signingKeys = make(map[string]jwt.Scope)
 	}
-	sort.Strings(a.signingKeys)
+	signersChanged := false
+	for k, scope := range ac.SigningKeys {
+		a.signingKeys[k] = scope
+	}
+	if !strict {
+		a.signingKeys[a.Name] = nil
+	}
 	if len(a.signingKeys) != len(old.signingKeys) {
 		signersChanged = true
-	} else {
-		for i := 0; i < len(old.signingKeys); i++ {
-			if a.signingKeys[i] != old.signingKeys[i] {
-				signersChanged = true
-				break
-			}
+	}
+	for k, scope := range a.signingKeys {
+		if oldScope, ok := old.signingKeys[k]; !ok {
+			signersChanged = true
+		} else if !reflect.DeepEqual(scope, oldScope) {
+			signersChanged = true
+			alteredScope[k] = struct{}{}
+		}
+	}
+	// collect mappings that need to be removed
+	removeList := []string{}
+	for _, m := range a.mappings {
+		if _, ok := ac.Mappings[jwt.Subject(m.src)]; !ok {
+			removeList = append(removeList, m.src)
 		}
 	}
 	a.mu.Unlock()
+
+	for sub, wm := range ac.Mappings {
+		mappings := make([]*MapDest, len(wm))
+		for i, m := range wm {
+			mappings[i] = &MapDest{
+				Subject: string(m.Subject),
+				Weight:  m.GetWeight(),
+				Cluster: m.Cluster,
+			}
+		}
+		// This will overwrite existing entries
+		a.AddWeightedMappings(string(sub), mappings...)
+	}
+	// remove mappings
+	for _, rmMapping := range removeList {
+		a.RemoveMapping(rmMapping)
+	}
 
 	gatherClients := func() []*client {
 		a.mu.RLock()
@@ -2889,7 +2923,8 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		switch e.Type {
 		case jwt.Stream:
 			s.Debugf("Adding stream export %q for %s", e.Subject, a.Name)
-			if err := a.AddStreamExport(string(e.Subject), authAccounts(e.TokenReq)); err != nil {
+			if err := a.addStreamExportWithAccountPos(
+				string(e.Subject), authAccounts(e.TokenReq), e.AccountTokenPosition); err != nil {
 				s.Debugf("Error adding stream export to account [%s]: %v", a.Name, err.Error())
 			}
 		case jwt.Service:
@@ -2901,7 +2936,8 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 			case jwt.ResponseTypeChunked:
 				rt = Chunked
 			}
-			if err := a.AddServiceExportWithResponse(string(e.Subject), rt, authAccounts(e.TokenReq)); err != nil {
+			if err := a.addServiceExportWithResponseAndAccountPos(
+				string(e.Subject), rt, authAccounts(e.TokenReq), e.AccountTokenPosition); err != nil {
 				s.Debugf("Error adding service export to account [%s]: %v", a.Name, err)
 				continue
 			}
@@ -3086,20 +3122,21 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 	if a.srv == nil {
 		a.srv = s
 	}
-	if jsEnabled {
-		if ac.Limits.JetStreamLimits.DiskStorage != 0 || ac.Limits.JetStreamLimits.MemoryStorage != 0 {
-			// JetStreamAccountLimits and jwt.JetStreamLimits use same value for unlimited
-			a.jsLimits = &JetStreamAccountLimits{
-				MaxMemory:    ac.Limits.JetStreamLimits.MemoryStorage,
-				MaxStore:     ac.Limits.JetStreamLimits.DiskStorage,
-				MaxStreams:   int(ac.Limits.JetStreamLimits.Streams),
-				MaxConsumers: int(ac.Limits.JetStreamLimits.Consumer),
-			}
-		} else if a.jsLimits != nil {
-			// covers failed update followed by disable
-			a.jsLimits = nil
+
+	// Setup js limits regardless of whether this server has jsEnabled.
+	if ac.Limits.JetStreamLimits.DiskStorage != 0 || ac.Limits.JetStreamLimits.MemoryStorage != 0 {
+		// JetStreamAccountLimits and jwt.JetStreamLimits use same value for unlimited
+		a.jsLimits = &JetStreamAccountLimits{
+			MaxMemory:    ac.Limits.JetStreamLimits.MemoryStorage,
+			MaxStore:     ac.Limits.JetStreamLimits.DiskStorage,
+			MaxStreams:   int(ac.Limits.JetStreamLimits.Streams),
+			MaxConsumers: int(ac.Limits.JetStreamLimits.Consumer),
 		}
+	} else if a.jsLimits != nil {
+		// covers failed update followed by disable
+		a.jsLimits = nil
 	}
+
 	a.updated = time.Now()
 	a.mu.Unlock()
 
@@ -3111,6 +3148,8 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		})
 	}
 
+	// If JetStream is enabled for this server we will call into configJetStream for the account
+	// regardless of enabled or disabled. It handles both cases.
 	if jsEnabled {
 		if err := s.configJetStream(a); err != nil {
 			s.Errorf("Error configuring jetstream for account [%s]: %v", a.Name, err.Error())
@@ -3119,6 +3158,11 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 			a.incomplete = true
 			a.mu.Unlock()
 		}
+	} else if a.jsLimits != nil {
+		// We do not have JS enabled for this server, but the account has it enabled so setup
+		// our imports properly. This allows this server to proxy JS traffic correctly.
+		s.checkJetStreamExports()
+		a.enableAllJetStreamServiceImports()
 	}
 
 	for i, c := range clients {
@@ -3151,9 +3195,18 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 	if signersChanged {
 		for _, c := range clients {
 			c.mu.Lock()
+			if c.user == nil {
+				c.mu.Unlock()
+				continue
+			}
 			sk := c.user.SigningKey
 			c.mu.Unlock()
-			if sk != "" && !a.hasIssuer(sk) {
+			if sk == _EMPTY_ {
+				continue
+			}
+			if _, ok := alteredScope[sk]; ok {
+				c.closeConnection(AuthenticationViolation)
+			} else if _, ok := a.hasIssuer(sk); !ok {
 				c.closeConnection(AuthenticationViolation)
 			}
 		}
@@ -3502,19 +3555,21 @@ func handleDeleteRequest(store *DirJWTStore, s *Server, msg []byte, reply string
 	}
 }
 
-func getOperator(s *Server) (string, error) {
+func getOperator(s *Server) (string, bool, error) {
 	var op string
+	var strict bool
 	if opts := s.getOpts(); opts != nil && len(opts.TrustedOperators) > 0 {
 		op = opts.TrustedOperators[0].Subject
+		strict = opts.TrustedOperators[0].StrictSigningKeyUsage
 	}
 	if op == "" {
-		return "", fmt.Errorf("no operator found")
+		return "", false, fmt.Errorf("no operator found")
 	}
-	return op, nil
+	return op, strict, nil
 }
 
 func (dr *DirAccResolver) Start(s *Server) error {
-	op, err := getOperator(s)
+	op, strict, err := getOperator(s)
 	if err != nil {
 		return err
 	}
@@ -3549,6 +3604,9 @@ func (dr *DirAccResolver) Start(s *Server) error {
 			} else if claim.Subject != pubKey {
 				err := errors.New("subject does not match jwt content")
 				respondToUpdate(s, resp, pubKey, "jwt update resulted in error", err)
+			} else if claim.Issuer == op && strict {
+				err := errors.New("operator requires issuer to be a signing key")
+				respondToUpdate(s, resp, pubKey, "jwt update resulted in error", err)
 			} else if err := dr.save(pubKey, string(msg)); err != nil {
 				respondToUpdate(s, resp, pubKey, "jwt update resulted in error", err)
 			} else {
@@ -3561,6 +3619,9 @@ func (dr *DirAccResolver) Start(s *Server) error {
 	if _, err := s.sysSubscribe(accClaimsReqSubj, func(_ *subscription, _ *client, subj, resp string, msg []byte) {
 		if claim, err := jwt.DecodeAccountClaims(string(msg)); err != nil {
 			respondToUpdate(s, resp, "n/a", "jwt update resulted in error", err)
+		} else if claim.Issuer == op && strict {
+			err := errors.New("operator requires issuer to be a signing key")
+			respondToUpdate(s, resp, claim.Subject, "jwt update resulted in error", err)
 		} else if err := dr.save(claim.Subject, string(msg)); err != nil {
 			respondToUpdate(s, resp, claim.Subject, "jwt update resulted in error", err)
 		} else {
@@ -3756,7 +3817,7 @@ func NewCacheDirAccResolver(path string, limit int64, ttl time.Duration, _ ...di
 }
 
 func (dr *CacheDirAccResolver) Start(s *Server) error {
-	op, err := getOperator(s)
+	op, strict, err := getOperator(s)
 	if err != nil {
 		return err
 	}
@@ -3790,6 +3851,9 @@ func (dr *CacheDirAccResolver) Start(s *Server) error {
 			} else if claim.Subject != pubKey {
 				err := errors.New("subject does not match jwt content")
 				respondToUpdate(s, resp, pubKey, "jwt update cache resulted in error", err)
+			} else if claim.Issuer == op && strict {
+				err := errors.New("operator requires issuer to be a signing key")
+				respondToUpdate(s, resp, pubKey, "jwt update cache resulted in error", err)
 			} else if _, ok := s.accounts.Load(pubKey); !ok {
 				respondToUpdate(s, resp, pubKey, "jwt update cache skipped", nil)
 			} else if err := dr.save(pubKey, string(msg)); err != nil {
@@ -3804,6 +3868,9 @@ func (dr *CacheDirAccResolver) Start(s *Server) error {
 	if _, err := s.sysSubscribe(accClaimsReqSubj, func(_ *subscription, _ *client, subj, resp string, msg []byte) {
 		if claim, err := jwt.DecodeAccountClaims(string(msg)); err != nil {
 			respondToUpdate(s, resp, "n/a", "jwt update cache resulted in error", err)
+		} else if claim.Issuer == op && strict {
+			err := errors.New("operator requires issuer to be a signing key")
+			respondToUpdate(s, resp, claim.Subject, "jwt update cache resulted in error", err)
 		} else if _, ok := s.accounts.Load(claim.Subject); !ok {
 			respondToUpdate(s, resp, claim.Subject, "jwt update cache skipped", nil)
 		} else if err := dr.save(claim.Subject, string(msg)); err != nil {

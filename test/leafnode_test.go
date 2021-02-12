@@ -621,6 +621,7 @@ type cluster struct {
 	servers []*server.Server
 	opts    []*server.Options
 	name    string
+	t       *testing.T
 }
 
 func testDefaultClusterOptionsForLeafNodes() *server.Options {
@@ -635,13 +636,23 @@ func testDefaultClusterOptionsForLeafNodes() *server.Options {
 	return &o
 }
 
-func shutdownCluster(c *cluster) {
+func (c *cluster) shutdown() {
 	if c == nil {
 		return
 	}
-	for _, s := range c.servers {
+	for i, s := range c.servers {
+		if cf := c.opts[i].ConfigFile; cf != "" {
+			os.RemoveAll(cf)
+		}
+		if sd := s.StoreDir(); sd != "" {
+			os.RemoveAll(sd)
+		}
 		s.Shutdown()
 	}
+}
+
+func shutdownCluster(c *cluster) {
+	c.shutdown()
 }
 
 func (c *cluster) totalSubs() int {
@@ -748,7 +759,7 @@ func createClusterEx(t *testing.T, doAccounts bool, gwSolicit time.Duration, wai
 	s := RunServer(o)
 	bindGlobal(s)
 
-	c := &cluster{servers: make([]*server.Server, 0, 3), opts: make([]*server.Options, 0, 3), name: clusterName}
+	c := &cluster{servers: make([]*server.Server, 0, numServers), opts: make([]*server.Options, 0, numServers), name: clusterName}
 	c.servers = append(c.servers, s)
 	c.opts = append(c.opts, o)
 
@@ -782,7 +793,7 @@ func createClusterEx(t *testing.T, doAccounts bool, gwSolicit time.Duration, wai
 			}
 		}
 	}
-
+	c.t = t
 	return c
 }
 
@@ -2989,7 +3000,7 @@ func TestLeafNodeAndGatewayGlobalRouting(t *testing.T) {
 	// its outbound GW connection to the requestor's server.
 	for i := 0; i < 3; i++ {
 		opts := cb.opts[i]
-		url := fmt.Sprintf("nats://ngs:pass@%s:%d", opts.Host, opts.Port)
+		url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 		nc, err := nats.Connect(url)
 		if err != nil {
 			t.Fatalf("Error on connect: %v", err)
@@ -4247,30 +4258,34 @@ func TestLeafnodeHeaders(t *testing.T) {
 	leaf, _ := runSolicitLeafServer(opts)
 	defer leaf.Shutdown()
 
+	checkLeafNodeConnected(t, srv)
+	checkLeafNodeConnected(t, leaf)
+
 	snc, err := nats.Connect(srv.ClientURL())
 	if err != nil {
 		t.Fatalf(err.Error())
 	}
 	defer snc.Close()
-	ssub, err := snc.SubscribeSync("test")
-	if err != nil {
-		t.Fatalf("subscribe failed: %s", err)
-	}
 
 	lnc, err := nats.Connect(leaf.ClientURL())
 	if err != nil {
 		t.Fatalf(err.Error())
 	}
 	defer lnc.Close()
+
+	// Start with subscription on leaf so that we check that srv has the interest
+	// (since we are going to publish from srv)
 	lsub, err := lnc.SubscribeSync("test")
 	if err != nil {
 		t.Fatalf("subscribe failed: %s", err)
 	}
 	lnc.Flush()
-
-	checkLeafNodeConnected(t, srv)
-	checkLeafNodeConnected(t, leaf)
 	checkSubInterest(t, srv, "$G", "test", time.Second)
+
+	ssub, err := snc.SubscribeSync("test")
+	if err != nil {
+		t.Fatalf("subscribe failed: %s", err)
+	}
 
 	msg := nats.NewMsg("test")
 	msg.Header.Add("Test", "Header")

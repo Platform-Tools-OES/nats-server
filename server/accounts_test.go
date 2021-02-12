@@ -22,9 +22,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
@@ -103,6 +105,200 @@ func TestAccountIsolation(t *testing.T) {
 	}
 	if !strings.HasPrefix(l, "PONG\r\n") {
 		t.Fatalf("PONG response incorrect: %q", l)
+	}
+}
+
+func TestAccountIsolationExportImport(t *testing.T) {
+	checkIsolation := func(t *testing.T, pubSubj string, ncExp, ncImp *nats.Conn) {
+		// We keep track of 2 subjects.
+		// One subject (pubSubj) is based off the stream import.
+		// The other subject "fizz" is not imported and should be isolated.
+
+		gotSubjs := map[string]int{
+			pubSubj: 0,
+			"fizz":  0,
+		}
+		count := int32(0)
+		ch := make(chan struct{}, 1)
+		if _, err := ncImp.Subscribe(">", func(m *nats.Msg) {
+			gotSubjs[m.Subject] += 1
+			if n := atomic.AddInt32(&count, 1); n == 3 {
+				ch <- struct{}{}
+			}
+		}); err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+		// Since both prod and cons use same server, flushing here will ensure
+		// that the interest is registered and known at the time we publish.
+		ncImp.Flush()
+
+		if err := ncExp.Publish(pubSubj, []byte(fmt.Sprintf("ncExp pub %s", pubSubj))); err != nil {
+			t.Fatal(err)
+		}
+		if err := ncImp.Publish(pubSubj, []byte(fmt.Sprintf("ncImp pub %s", pubSubj))); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := ncExp.Publish("fizz", []byte("ncExp pub fizz")); err != nil {
+			t.Fatal(err)
+		}
+		if err := ncImp.Publish("fizz", []byte("ncImp pub fizz")); err != nil {
+			t.Fatal(err)
+		}
+
+		wantSubjs := map[string]int{
+			// Subscriber ncImp should receive publishes from ncExp and ncImp.
+			pubSubj: 2,
+			// Subscriber ncImp should only receive the publish from ncImp.
+			"fizz": 1,
+		}
+
+		// Wait for at least the 3 expected messages
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("Expected 3 messages, got %v", atomic.LoadInt32(&count))
+		}
+		// But now wait a bit to see if subscription receives more than expected.
+		time.Sleep(50 * time.Millisecond)
+
+		if got, want := len(gotSubjs), len(wantSubjs); got != want {
+			t.Fatalf("unexpected subjs len, got=%d; want=%d", got, want)
+		}
+
+		for key, gotCnt := range gotSubjs {
+			if wantCnt := wantSubjs[key]; gotCnt != wantCnt {
+				t.Errorf("unexpected receive count for subject %q, got=%d, want=%d", key, gotCnt, wantCnt)
+			}
+		}
+	}
+
+	cases := []struct {
+		name     string
+		exp, imp string
+		pubSubj  string
+	}{
+		{
+			name: "export literal, import literal",
+			exp:  "foo", imp: "foo",
+			pubSubj: "foo",
+		},
+		{
+			name: "export full wildcard, import literal",
+			exp:  "foo.>", imp: "foo.bar",
+			pubSubj: "foo.bar",
+		},
+		{
+			name: "export full wildcard, import sublevel full wildcard",
+			exp:  "foo.>", imp: "foo.bar.>",
+			pubSubj: "foo.bar.whizz",
+		},
+		{
+			name: "export full wildcard, import full wildcard",
+			exp:  "foo.>", imp: "foo.>",
+			pubSubj: "foo.bar",
+		},
+		{
+			name: "export partial wildcard, import partial wildcard",
+			exp:  "foo.*", imp: "foo.*",
+			pubSubj: "foo.bar",
+		},
+		{
+			name: "export mid partial wildcard, import mid partial wildcard",
+			exp:  "foo.*.bar", imp: "foo.*.bar",
+			pubSubj: "foo.whizz.bar",
+		},
+	}
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("%s jwt", c.name), func(t *testing.T) {
+			// Setup NATS server.
+			s := opTrustBasicSetup()
+			defer s.Shutdown()
+			go s.Start()
+			if !s.ReadyForConnections(5 * time.Second) {
+				t.Fatal("failed to be ready for connections")
+			}
+			buildMemAccResolver(s)
+
+			// Setup exporter account.
+			accExpPair, accExpPub := createKey(t)
+			accExpClaims := jwt.NewAccountClaims(accExpPub)
+			if c.exp != "" {
+				accExpClaims.Limits.WildcardExports = true
+				accExpClaims.Exports.Add(&jwt.Export{
+					Name:    fmt.Sprintf("%s-stream-export", c.exp),
+					Subject: jwt.Subject(c.exp),
+					Type:    jwt.Stream,
+				})
+			}
+			accExpJWT, err := accExpClaims.Encode(oKp)
+			require_NoError(t, err)
+			addAccountToMemResolver(s, accExpPub, accExpJWT)
+
+			// Setup importer account.
+			accImpPair, accImpPub := createKey(t)
+			accImpClaims := jwt.NewAccountClaims(accImpPub)
+			if c.imp != "" {
+				accImpClaims.Imports.Add(&jwt.Import{
+					Name:    fmt.Sprintf("%s-stream-import", c.imp),
+					Subject: jwt.Subject(c.imp),
+					Account: accExpPub,
+					Type:    jwt.Stream,
+				})
+			}
+			accImpJWT, err := accImpClaims.Encode(oKp)
+			require_NoError(t, err)
+			addAccountToMemResolver(s, accImpPub, accImpJWT)
+
+			// Connect with different accounts.
+			ncExp := natsConnect(t, s.ClientURL(), createUserCreds(t, nil, accExpPair),
+				nats.Name(fmt.Sprintf("nc-exporter-%s", c.exp)))
+			ncImp := natsConnect(t, s.ClientURL(), createUserCreds(t, nil, accImpPair),
+				nats.Name(fmt.Sprintf("nc-importer-%s", c.imp)))
+			defer ncExp.Close()
+			defer ncImp.Close()
+
+			checkIsolation(t, c.pubSubj, ncExp, ncImp)
+			if t.Failed() {
+				t.Logf("exported=%q; imported=%q", c.exp, c.imp)
+			}
+		})
+
+		t.Run(fmt.Sprintf("%s conf", c.name), func(t *testing.T) {
+			// Setup NATS server.
+			cf := createConfFile(t, []byte(fmt.Sprintf(`
+				port: -1
+
+				accounts: {
+					accExp: {
+						users: [{user: accExp, password: accExp}]
+						exports: [{stream: %q}]
+					}
+					accImp: {
+						users: [{user: accImp, password: accImp}]
+						imports: [{stream: {account: accExp, subject: %q}}]
+					}
+				}
+			`,
+				c.exp, c.imp,
+			)))
+			defer os.Remove(cf)
+			s, _ := RunServerWithConfig(cf)
+			defer s.Shutdown()
+
+			// Connect with different accounts.
+			ncExp := natsConnect(t, s.ClientURL(), nats.UserInfo("accExp", "accExp"),
+				nats.Name(fmt.Sprintf("nc-exporter-%s", c.exp)))
+			ncImp := natsConnect(t, s.ClientURL(), nats.UserInfo("accImp", "accImp"),
+				nats.Name(fmt.Sprintf("nc-importer-%s", c.imp)))
+			defer ncExp.Close()
+			defer ncImp.Close()
+
+			checkIsolation(t, c.pubSubj, ncExp, ncImp)
+			if t.Failed() {
+				t.Logf("exported=%q; imported=%q", c.exp, c.imp)
+			}
+		})
 	}
 }
 
@@ -593,6 +789,31 @@ func TestImportAuthorized(t *testing.T) {
 	checkBool(foo.checkStreamImportAuthorized(bar, "foo.*", nil), true, t)
 	checkBool(foo.checkStreamImportAuthorized(bar, "*.*", nil), true, t)
 	checkBool(foo.checkStreamImportAuthorized(bar, "*.>", nil), true, t)
+
+	_, foo, bar = simpleAccountServer(t)
+	foo.addStreamExportWithAccountPos("foo.*", []*Account{}, 2)
+	foo.addStreamExportWithAccountPos("bar.*.foo", []*Account{}, 2)
+	if err := foo.addStreamExportWithAccountPos("baz.*.>", []*Account{}, 3); err == nil {
+		t.Fatal("expected error")
+	}
+	checkBool(foo.checkStreamImportAuthorized(bar, fmt.Sprintf("foo.%s", bar.Name), nil), true, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, fmt.Sprintf("bar.%s.foo", bar.Name), nil), true, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, fmt.Sprintf("baz.foo.%s", bar.Name), nil), false, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, "foo.X", nil), false, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, "bar.X.foo", nil), false, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, "baz.foo.X", nil), false, t)
+
+	foo.addServiceExportWithAccountPos("a.*", []*Account{}, 2)
+	foo.addServiceExportWithAccountPos("b.*.a", []*Account{}, 2)
+	if err := foo.addServiceExportWithAccountPos("c.*.>", []*Account{}, 3); err == nil {
+		t.Fatal("expected error")
+	}
+	checkBool(foo.checkServiceImportAuthorized(bar, fmt.Sprintf("a.%s", bar.Name), nil), true, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, fmt.Sprintf("b.%s.a", bar.Name), nil), true, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, fmt.Sprintf("c.a.%s", bar.Name), nil), false, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, "a.X", nil), false, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, "b.X.a", nil), false, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, "c.a.X", nil), false, t)
 
 	// Reset and test pwc and fwc
 	s, foo, bar := simpleAccountServer(t)
@@ -3044,4 +3265,30 @@ func TestSubjectTransforms(t *testing.T) {
 	shouldMatch("baz.>", "my.pre.>", "baz.1.2.3", "my.pre.1.2.3")
 	shouldMatch("baz.>", "foo.bar.>", "baz.1.2.3", "foo.bar.1.2.3")
 	shouldMatch("*", "foo.bar.$1", "foo", "foo.bar.foo")
+}
+
+func TestAccountSystemPermsWithGlobalAccess(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts {
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+	`))
+	defer os.Remove(conf)
+
+	s, _ := RunServerWithConfig(conf)
+
+	// Make sure we can connect with no auth to global account as normal.
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer nc.Close()
+
+	// Make sure we can connect to the system account with correct credentials.
+	sc, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	if err != nil {
+		t.Fatalf("Failed to create system client: %v", err)
+	}
+	defer sc.Close()
 }

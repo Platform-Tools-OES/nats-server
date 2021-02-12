@@ -30,6 +30,7 @@ import (
 
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 )
 
 type mqttErrorReader struct {
@@ -731,7 +732,7 @@ func TestMQTTRequiresJSEnabled(t *testing.T) {
 	o.Accounts = []*Account{acc}
 	o.Users = []*User{&User{Username: "mqtt", Account: acc}}
 	s := testMQTTRunServer(t, o)
-	defer s.Shutdown()
+	defer testMQTTShutdownServer(s)
 
 	addr := fmt.Sprintf("%s:%d", o.MQTT.Host, o.MQTT.Port)
 	c, err := net.Dial("tcp", addr)
@@ -1112,6 +1113,83 @@ func TestMQTTTokenAuth(t *testing.T) {
 				user:      "ignore_use_token",
 				pass:      test.token,
 			}
+			mc, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+			defer mc.Close()
+			testMQTTCheckConnAck(t, r, test.rc, false)
+		})
+	}
+}
+
+func TestMQTTJWTWithAllowedConnectionTypes(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	// Create System Account
+	syskp, _ := nkeys.CreateAccount()
+	syspub, _ := syskp.PublicKey()
+	sysAc := jwt.NewAccountClaims(syspub)
+	sysjwt, err := sysAc.Encode(oKp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	// Create memory resolver and store system account
+	mr := &MemAccResolver{}
+	mr.Store(syspub, sysjwt)
+	if err != nil {
+		t.Fatalf("Error saving system account JWT to memory resolver: %v", err)
+	}
+	// Add system account and memory resolver to server options
+	o.SystemAccount = syspub
+	o.AccountResolver = mr
+	setupAddTrusted(o)
+
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	for _, test := range []struct {
+		name            string
+		connectionTypes []string
+		rc              byte
+	}{
+		{"not allowed", []string{jwt.ConnectionTypeStandard}, mqttConnAckRCNotAuthorized},
+		{"allowed", []string{jwt.ConnectionTypeStandard, strings.ToLower(jwt.ConnectionTypeMqtt)}, mqttConnAckRCConnectionAccepted},
+		{"allowed with unknown", []string{jwt.ConnectionTypeMqtt, "SomeNewType"}, mqttConnAckRCConnectionAccepted},
+		{"not allowed with unknown", []string{"SomeNewType"}, mqttConnAckRCNotAuthorized},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+
+			nuc := newJWTTestUserClaims()
+			nuc.AllowedConnectionTypes = test.connectionTypes
+			nuc.BearerToken = true
+
+			okp, _ := nkeys.FromSeed(oSeed)
+
+			akp, _ := nkeys.CreateAccount()
+			apub, _ := akp.PublicKey()
+			nac := jwt.NewAccountClaims(apub)
+			// Enable Jetstream on account with lax limitations
+			nac.Limits.JetStreamLimits.Consumer = -1
+			nac.Limits.JetStreamLimits.Streams = -1
+			nac.Limits.JetStreamLimits.MemoryStorage = 1024 * 1024
+			ajwt, err := nac.Encode(okp)
+			if err != nil {
+				t.Fatalf("Error generating account JWT: %v", err)
+			}
+
+			nkp, _ := nkeys.CreateUser()
+			pub, _ := nkp.PublicKey()
+			nuc.Subject = pub
+			jwt, err := nuc.Encode(akp)
+			if err != nil {
+				t.Fatalf("Error generating user JWT: %v", err)
+			}
+
+			addAccountToMemResolver(s, apub, ajwt)
+
+			ci := &mqttConnInfo{
+				cleanSess: true,
+				user:      "ignore_use_token",
+				pass:      jwt,
+			}
+
 			mc, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
 			defer mc.Close()
 			testMQTTCheckConnAck(t, r, test.rc, false)
@@ -2282,6 +2360,11 @@ func TestMQTTSubWithNATSStream(t *testing.T) {
 	testMQTTSub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: "foo/bar", qos: 1}}, []byte{1})
 	testMQTTFlush(t, mc, nil, r)
 
+	mcp, rp := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+	testMQTTFlush(t, mcp, nil, rp)
+
 	nc := natsConnect(t, s.ClientURL())
 	defer nc.Close()
 
@@ -2291,7 +2374,7 @@ func TestMQTTSubWithNATSStream(t *testing.T) {
 		Retention: InterestPolicy,
 		Subjects:  []string{"foo.>"},
 	}
-	mset, err := s.GlobalAccount().AddStream(sc)
+	mset, err := s.GlobalAccount().addStream(sc)
 	if err != nil {
 		t.Fatalf("Unable to create stream: %v", err)
 	}
@@ -2302,7 +2385,7 @@ func TestMQTTSubWithNATSStream(t *testing.T) {
 		AckPolicy:      AckExplicit,
 		DeliverSubject: "bar",
 	}
-	if _, err := mset.AddConsumer(cc); err != nil {
+	if _, err := mset.addConsumer(cc); err != nil {
 		t.Fatalf("Unable to add consumer: %v", err)
 	}
 
@@ -2327,11 +2410,11 @@ func TestMQTTSubWithNATSStream(t *testing.T) {
 	checkRecv("nats", 0)
 
 	// Send from MQTT as a QoS0
-	testMQTTPublish(t, mc, r, 0, false, false, "foo/bar", 0, []byte("qos0"))
+	testMQTTPublish(t, mcp, rp, 0, false, false, "foo/bar", 0, []byte("qos0"))
 	checkRecv("qos0", 0)
 
 	// Send from MQTT as a QoS1
-	testMQTTPublish(t, mc, r, 1, false, false, "foo/bar", 1, []byte("qos1"))
+	testMQTTPublish(t, mcp, rp, 1, false, false, "foo/bar", 1, []byte("qos1"))
 	checkRecv("qos1", mqttPubQos1)
 }
 
@@ -2372,7 +2455,7 @@ func TestMQTTPreventDeleteMQTTStreamsAndConsumers(t *testing.T) {
 	testMQTTSub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: "foo/bar", qos: 1}}, []byte{1})
 	testMQTTFlush(t, mc, nil, r)
 
-	mset, err := s.GlobalAccount().LookupStream(mqttStreamName)
+	mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
 	if err != nil {
 		t.Fatalf("Error looking up stream: %v", err)
 	}
@@ -3670,6 +3753,9 @@ func TestMQTTMaxAckPending(t *testing.T) {
 	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubQos1, []byte("msg2"))
 	testMQTTDisconnect(t, c, nil)
 
+	// Give a chance to the server to register that this client is gone.
+	checkClientsCount(t, s, 1)
+
 	// Send 2 messages while sub is offline
 	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("msg3"))
 	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("msg4"))
@@ -3739,7 +3825,7 @@ func TestMQTTMaxAckPendingForMultipleSubs(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.MaxAckPending = 1
 	s := testMQTTRunServer(t, o)
-	defer s.Shutdown()
+	defer testMQTTShutdownServer(s)
 
 	cisub := &mqttConnInfo{clientID: "sub", cleanSess: false}
 	c, r := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
@@ -3784,7 +3870,7 @@ func TestMQTTConfigReload(t *testing.T) {
 	defer os.Remove(conf)
 
 	s, o := RunServerWithConfig(conf)
-	defer s.Shutdown()
+	defer testMQTTShutdownServer(s)
 
 	if val := o.MQTT.AckWait; val != 5*time.Second {
 		t.Fatalf("Invalid ackwait: %v", val)
@@ -3820,11 +3906,11 @@ func TestMQTTConfigReload(t *testing.T) {
 	}
 	c.Close()
 	cp.Close()
-	s.Shutdown()
+	testMQTTShutdownServer(s)
 
 	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(template, `"30s"`, `1`)))
 	s, o = RunServerWithConfig(conf)
-	defer s.Shutdown()
+	defer testMQTTShutdownServer(s)
 
 	c, r = testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
@@ -3856,7 +3942,7 @@ func TestMQTTConfigReload(t *testing.T) {
 func TestMQTTStreamInfoReturnsNonEmptySubject(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
-	defer s.Shutdown()
+	defer testMQTTShutdownServer(s)
 
 	cisub := &mqttConnInfo{clientID: "sub", cleanSess: false}
 	c, r := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)

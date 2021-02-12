@@ -300,8 +300,8 @@ func TestSystemAccountNewConnection(t *testing.T) {
 	}
 	if !strings.HasPrefix(connsMsg.Subject, fmt.Sprintf("$SYS.ACCOUNT.%s.SERVER.CONNS", acc2.Name)) {
 		t.Fatalf("Expected subject to start with %q, got %q", "$SYS.ACCOUNT.<account>.CONNECT", msg.Subject)
-	} else if !strings.Contains(string(connsMsg.Data), `"total_conns": 0`) {
-		t.Fatalf("Expected event to reflect created connection, got: %s", string(msg.Data))
+	} else if !strings.Contains(string(connsMsg.Data), `"total_conns":0`) {
+		t.Fatalf("Expected event to reflect created connection, got: %s", string(connsMsg.Data))
 	}
 	conns = AccountNumConns{}
 	if err := json.Unmarshal(connsMsg.Data, &conns); err != nil {
@@ -1232,12 +1232,15 @@ func TestAccountReqMonitoring(t *testing.T) {
 	defer s.Shutdown()
 	sacc, sakp := createAccount(s)
 	s.setSystemAccount(sacc)
+	s.EnableJetStream(nil)
 	acc, akp := createAccount(s)
 	if acc == nil {
 		t.Fatalf("did not create account")
 	}
+	acc.EnableJetStream(nil)
 	subsz := fmt.Sprintf(accReqSubj, acc.Name, "SUBSZ")
 	connz := fmt.Sprintf(accReqSubj, acc.Name, "CONNZ")
+	jsz := fmt.Sprintf(accReqSubj, acc.Name, "JSZ")
 	// Create system account connection to query
 	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 	ncSys, err := nats.Connect(url, createUserCreds(t, s, sakp))
@@ -1254,7 +1257,7 @@ func TestAccountReqMonitoring(t *testing.T) {
 	// query SUBSZ for account
 	if resp, err := ncSys.Request(subsz, nil, time.Second); err != nil {
 		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_subscriptions": 0`) {
+	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":25,`) {
 		t.Fatalf("unexpected subs count (expected 0): %v", string(resp.Data))
 	}
 	// create a subscription
@@ -1267,18 +1270,26 @@ func TestAccountReqMonitoring(t *testing.T) {
 	// query SUBSZ for account
 	if resp, err := ncSys.Request(subsz, nil, time.Second); err != nil {
 		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_subscriptions": 1`) {
-		t.Fatalf("unexpected subs count (expected 1): %v", string(resp.Data))
-	} else if !strings.Contains(string(resp.Data), `"subject": "foo"`) {
+	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":26,`) {
+		t.Fatalf("unexpected subs count (expected 26): %v", string(resp.Data))
+	} else if !strings.Contains(string(resp.Data), `"subject":"foo"`) {
 		t.Fatalf("expected subscription foo: %v", string(resp.Data))
 	}
 	// query connections for account
 	if resp, err := ncSys.Request(connz, nil, time.Second); err != nil {
 		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_connections": 1`) {
+	} else if !strings.Contains(string(resp.Data), `"num_connections":1,`) {
 		t.Fatalf("unexpected subs count (expected 1): %v", string(resp.Data))
-	} else if !strings.Contains(string(resp.Data), `"total": 2`) { // includes system acc connection
+	} else if !strings.Contains(string(resp.Data), `"total":2,`) { // includes system acc connection
 		t.Fatalf("unexpected subs count (expected 1): %v", string(resp.Data))
+	}
+	// query connections for js account
+	if resp, err := ncSys.Request(jsz, nil, time.Second); err != nil {
+		t.Fatalf("Error on request: %v", err)
+	} else if !strings.Contains(string(resp.Data), `"memory":0,`) {
+		t.Fatalf("jetstream should be enabled but empty: %v", string(resp.Data))
+	} else if !strings.Contains(string(resp.Data), `"storage":0,`) {
+		t.Fatalf("jetstream should be enabled but empty: %v", string(resp.Data))
 	}
 }
 
@@ -1583,7 +1594,7 @@ func TestSystemAccountWithGateways(t *testing.T) {
 
 	// If this tests fails with wrong number after 10 seconds we may have
 	// added a new inititial subscription for the eventing system.
-	checkExpectedSubs(t, 33, sa)
+	checkExpectedSubs(t, 37, sa)
 
 	// Create a client on B and see if we receive the event
 	urlb := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
@@ -1922,7 +1933,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 		respField []string
 	}{
 		{"VARZ", nil, &Varz{},
-			[]string{"now", "cpu"}},
+			[]string{"now", "cpu", "system_account"}},
 		{"SUBSZ", nil, &Subsz{},
 			[]string{"num_subscriptions", "num_cache"}},
 		{"CONNZ", nil, &Connz{},
@@ -1972,6 +1983,8 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 			[]string{"now", "routes"}},
 		{"ROUTEZ", json.RawMessage(`{"cluster":"TEST CLUSTER 22", "subscriptions":true}`), &Routez{},
 			[]string{"now", "routes"}},
+
+		{"JSZ", nil, &JSzOptions{}, []string{"now", "disabled"}},
 	}
 
 	for i, test := range tests {
@@ -2177,4 +2190,91 @@ func TestServerEventsReceivedByQSubs(t *testing.T) {
 	if dem.Reason != "Authentication Failure" {
 		t.Fatalf("Expected auth error, got %q", dem.Reason)
 	}
+}
+
+func TestServerEventsFilteredByTag(t *testing.T) {
+	confA := createConfFile(t, []byte(`
+		listen: -1
+		server_name: srv-A
+		server_tags: ["foo", "bar"]
+		cluster {
+			name: clust
+			listen: -1
+			no_advertise: true
+		}
+		system_account: SYS
+		accounts: {
+			SYS: {
+				users: [
+					{user: b, password: b}
+				]
+			}
+		}
+		no_auth_user: b
+    `))
+	defer os.Remove(confA)
+	sA, _ := RunServerWithConfig(confA)
+	defer sA.Shutdown()
+	confB := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: -1
+		server_name: srv-B
+		server_tags: ["bar", "baz"]
+		cluster {
+			name: clust
+			listen: -1
+			no_advertise: true
+			routes [
+				nats-route://localhost:%d
+			]
+		}
+		system_account: SYS
+		accounts: {
+			SYS: {
+				users: [
+					{user: b, password: b}
+				]
+			}
+		}
+		no_auth_user: b
+    `, sA.opts.Cluster.Port)))
+	defer os.Remove(confB)
+	sB, _ := RunServerWithConfig(confB)
+	defer sB.Shutdown()
+	checkClusterFormed(t, sA, sB)
+	nc := natsConnect(t, sA.ClientURL())
+	defer nc.Close()
+
+	ib := nats.NewInbox()
+	req := func(tags ...string) {
+		t.Helper()
+		r, err := json.Marshal(VarzEventOptions{EventFilterOptions: EventFilterOptions{Tags: tags}})
+		require_NoError(t, err)
+		err = nc.PublishRequest(fmt.Sprintf(serverPingReqSubj, "VARZ"), ib, r)
+		require_NoError(t, err)
+	}
+
+	msgs := make(chan *nats.Msg, 10)
+	defer close(msgs)
+	_, err := nc.ChanSubscribe(ib, msgs)
+	require_NoError(t, err)
+	req("none")
+	select {
+	case <-msgs:
+		t.Fatalf("no message expected")
+	case <-time.After(200 * time.Millisecond):
+	}
+	req("foo")
+	m := <-msgs
+	require_Contains(t, string(m.Data), "srv-A", "foo", "bar")
+	req("foo", "bar")
+	m = <-msgs
+	require_Contains(t, string(m.Data), "srv-A", "foo", "bar")
+	req("baz")
+	m = <-msgs
+	require_Contains(t, string(m.Data), "srv-B", "bar", "baz")
+	req("bar")
+	m1 := <-msgs
+	m2 := <-msgs
+	require_Contains(t, string(m1.Data)+string(m2.Data), "srv-A", "srv-B", "foo", "bar", "baz")
+	require_Len(t, len(msgs), 0)
 }
