@@ -47,6 +47,8 @@ type FileStoreConfig struct {
 	CacheExpire time.Duration
 	// SyncInterval is how often we sync to disk in the background.
 	SyncInterval time.Duration
+	// AsyncFlush allows async flush to batch write operations.
+	AsyncFlush bool
 }
 
 // FileStreamInfo allows us to remember created time.
@@ -55,68 +57,11 @@ type FileStreamInfo struct {
 	StreamConfig
 }
 
-// Need an alias (which does not have MarshalJSON/UnmarshalJSON) to avoid
-// recursive calls which would lead to stack overflow.
-type fileStreamInfoAlias FileStreamInfo
-
-// We will use this struct definition to serialize/deserialize FileStreamInfo
-// object. This embeds FileStreamInfo (the alias to prevent recursive calls)
-// and makes the non-public options public so they can be persisted/recovered.
-type fileStreamInfoJSON struct {
-	fileStreamInfoAlias
-	Internal       bool `json:"internal,omitempty"`
-	AllowNoSubject bool `json:"allow_no_subject,omitempty"`
-}
-
-func (fsi FileStreamInfo) MarshalJSON() ([]byte, error) {
-	return json.Marshal(&fileStreamInfoJSON{
-		fileStreamInfoAlias(fsi),
-		fsi.internal,
-		fsi.allowNoSubject,
-	})
-}
-
-func (fsi *FileStreamInfo) UnmarshalJSON(b []byte) error {
-	fsiJSON := &fileStreamInfoJSON{}
-	if err := json.Unmarshal(b, &fsiJSON); err != nil {
-		return err
-	}
-	*fsi = FileStreamInfo(fsiJSON.fileStreamInfoAlias)
-	fsi.internal = fsiJSON.Internal
-	fsi.allowNoSubject = fsiJSON.AllowNoSubject
-	return nil
-}
-
 // File ConsumerInfo is used for creating consumer stores.
 type FileConsumerInfo struct {
 	Created time.Time
 	Name    string
 	ConsumerConfig
-}
-
-// See fileStreamInfoAlias, etc.. for details on how this all work.
-type fileConsumerInfoAlias FileConsumerInfo
-
-type fileConsumerInfoJSON struct {
-	fileConsumerInfoAlias
-	AllowNoInterest bool `json:"allow_no_interest,omitempty"`
-}
-
-func (fci FileConsumerInfo) MarshalJSON() ([]byte, error) {
-	return json.Marshal(&fileConsumerInfoJSON{
-		fileConsumerInfoAlias(fci),
-		fci.allowNoInterest,
-	})
-}
-
-func (fci *FileConsumerInfo) UnmarshalJSON(b []byte) error {
-	fciJSON := &fileConsumerInfoJSON{}
-	if err := json.Unmarshal(b, &fciJSON); err != nil {
-		return err
-	}
-	*fci = FileConsumerInfo(fciJSON.fileConsumerInfoAlias)
-	fci.allowNoInterest = fciJSON.AllowNoInterest
-	return nil
 }
 
 type fileStore struct {
@@ -141,23 +86,24 @@ type fileStore struct {
 
 // Represents a message store block and its data.
 type msgBlock struct {
-	mu    sync.RWMutex
-	fs    *fileStore
-	mfn   string
-	mfd   *os.File
-	ifn   string
-	ifd   *os.File
-	liwsz int64
-	index uint64
-	bytes uint64
-	msgs  uint64
-	first msgId
-	last  msgId
-	lwits int64
-
+	// Here for 32bit systems and atomic.
+	first   msgId
+	last    msgId
+	mu      sync.RWMutex
+	fs      *fileStore
+	mfn     string
+	mfd     *os.File
+	ifn     string
+	ifd     *os.File
+	liwsz   int64
+	index   uint64
+	bytes   uint64
+	msgs    uint64
+	lwits   int64
 	lwts    int64
 	llts    int64
 	lrts    int64
+	llseq   uint64
 	hh      hash.Hash64
 	cache   *cache
 	cloads  uint64
@@ -228,7 +174,7 @@ const (
 	// cache idx expiration
 	defaultCacheIdxExpiration = 5 * time.Minute
 	// default sync interval
-	defaultSyncInterval = 10 * time.Second
+	defaultSyncInterval = 60 * time.Second
 	// coalesceMinimum
 	coalesceMinimum = 16 * 1024
 	// maxFlushWait is maximum we will wait to gather messages to flush.
@@ -238,11 +184,11 @@ const (
 	JetStreamMetaFileSum = "meta.sum"
 
 	// Default stream block size.
-	defaultStreamBlockSize = 64 * 1024 * 1024 // 64MB
+	defaultStreamBlockSize = 16 * 1024 * 1024 // 16MB
 	// Default for workqueue or interest based.
-	defaultOtherBlockSize = 32 * 1024 * 1024 // 32MB
+	defaultOtherBlockSize = 8 * 1024 * 1024 // 8MB
 	// max block size for now.
-	maxBlockSize = 2 * defaultStreamBlockSize
+	maxBlockSize = defaultStreamBlockSize
 	// FileStoreMinBlkSize is minimum size we will do for a blk size.
 	FileStoreMinBlkSize = 32 * 1000 // 32kib
 	// FileStoreMaxBlkSize is maximum size we will do for a blk size.
@@ -250,7 +196,7 @@ const (
 )
 
 func newFileStore(fcfg FileStoreConfig, cfg StreamConfig) (*fileStore, error) {
-	return newFileStoreWithCreated(fcfg, cfg, time.Now())
+	return newFileStoreWithCreated(fcfg, cfg, time.Now().UTC())
 }
 
 func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created time.Time) (*fileStore, error) {
@@ -294,10 +240,8 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		qch:  make(chan struct{}),
 	}
 
-	// Although originally designed to be able to flush multiple writes to disk
-	// for now we will suppress this behavior and at least flush in place and call
-	// into the OS. Sync is still handled async.
-	fs.fip = true
+	// Set flush in place to AsyncFlush which by default is false.
+	fs.fip = !fcfg.AsyncFlush
 
 	// Check if this is a new setup.
 	mdir := path.Join(fcfg.StoreDir, msgDir)
@@ -464,8 +408,8 @@ func (fs *fileStore) recoverMsgBlock(fi os.FileInfo, index uint64) *msgBlock {
 	// Close here since we need to rebuild state.
 	file.Close()
 
-	// If we get an error rebuilding the message block state record that with the fs itself.
-	if ld, err := mb.rebuildState(); err != nil && ld != nil {
+	// If we get data loss rebuilding the message block state record that with the fs itself.
+	if ld, _ := mb.rebuildState(); ld != nil {
 		fs.rebuildState(ld)
 	}
 	// Rewrite this to make sure we are sync'd.
@@ -520,6 +464,7 @@ func (mb *msgBlock) rebuildState() (*LostStreamData, error) {
 	// Clear state we need to rebuild.
 	mb.msgs, mb.bytes = 0, 0
 	mb.last.seq, mb.last.ts = 0, 0
+	firstNeedsSet := true
 
 	buf, err := ioutil.ReadFile(mb.mfn)
 	if err != nil {
@@ -543,18 +488,22 @@ func (mb *msgBlock) rebuildState() (*LostStreamData, error) {
 		if mb.mfd != nil {
 			fd = mb.mfd
 		} else {
-			fd, _ := os.Open(mb.mfn)
-			defer fd.Close()
+			fd, err = os.OpenFile(mb.mfn, os.O_RDWR, 0644)
+			if err != nil {
+				defer fd.Close()
+			}
 		}
-		if fd != nil {
-			fd.Truncate(int64(index))
-			fd.Sync()
+		if fd == nil {
+			return
+		}
+		if err := fd.Truncate(int64(index)); err == nil {
 			// Update our checksum.
 			if index >= 8 {
 				var lchk [8]byte
-				mb.mfd.ReadAt(lchk[:], int64(index-8))
+				fd.ReadAt(lchk[:], int64(index-8))
 				copy(mb.lchk[0:], lchk[:])
 			}
+			fd.Sync()
 		}
 	}
 
@@ -568,10 +517,16 @@ func (mb *msgBlock) rebuildState() (*LostStreamData, error) {
 	}
 
 	for index, lbuf := uint32(0), uint32(len(buf)); index < lbuf; {
+		if index+msgHdrSize >= lbuf {
+			truncate(index)
+			return gatherLost(lbuf - index), nil
+		}
+
 		hdr := buf[index : index+msgHdrSize]
 		rl := le.Uint32(hdr[0:])
 		slen := le.Uint16(hdr[20:])
 
+		hasHeaders := rl&hbit != 0
 		// Clear any headers bit that could be set.
 		rl &^= hbit
 		dlen := int(rl) - msgHdrSize
@@ -589,17 +544,21 @@ func (mb *msgBlock) rebuildState() (*LostStreamData, error) {
 		seq := le.Uint64(hdr[4:])
 		ts := int64(le.Uint64(hdr[12:]))
 
-		// If the first seq we read does not match our indexed first seq, reset.
-		if index == 0 && seq > mb.first.seq {
-			mb.first.seq = seq
-		}
-
 		// This is an old erased message, or a new one that we can track.
 		if seq == 0 || seq&ebit != 0 || seq < mb.first.seq {
 			seq = seq &^ ebit
 			addToDmap(seq)
 			index += rl
 			continue
+		}
+
+		// This is for when we have index info that adjusts for deleted messages
+		// at the head. So the first.seq will be already set here. If this is larger
+		// replace what we have with this seq.
+		if firstNeedsSet && seq > mb.first.seq {
+			firstNeedsSet = false
+			mb.first.seq = seq
+			mb.first.ts = ts
 		}
 
 		var deleted bool
@@ -615,15 +574,21 @@ func (mb *msgBlock) rebuildState() (*LostStreamData, error) {
 				hh.Reset()
 				hh.Write(hdr[4:20])
 				hh.Write(data[:slen])
-				hh.Write(data[slen : dlen-8])
+				if hasHeaders {
+					hh.Write(data[slen+4 : dlen-8])
+				} else {
+					hh.Write(data[slen : dlen-8])
+				}
 				checksum := hh.Sum(nil)
 				if !bytes.Equal(checksum, data[len(data)-8:]) {
 					truncate(index)
 					return gatherLost(lbuf - index), errBadMsg
 				}
+				copy(mb.lchk[0:], checksum)
 			}
 
-			if mb.first.seq == 0 {
+			if firstNeedsSet {
+				firstNeedsSet = false
 				mb.first.seq = seq
 				mb.first.ts = ts
 			}
@@ -754,15 +719,46 @@ func (fs *fileStore) hashKeyForBlock(index uint64) []byte {
 	return []byte(fmt.Sprintf("%s-%d", fs.cfg.Name, index))
 }
 
+func (mb *msgBlock) setupWriteCache(buf []byte) {
+	// Make sure we have a cache setup.
+	if mb.cache != nil {
+		return
+	}
+	mb.cache = &cache{buf: buf}
+	// Make sure we set the proper cache offset if we have existing data.
+	var fi os.FileInfo
+	if mb.mfd != nil {
+		fi, _ = mb.mfd.Stat()
+	} else {
+		fi, _ = os.Stat(mb.mfn)
+	}
+	if fi != nil {
+		mb.cache.off = int(fi.Size())
+	}
+	mb.startCacheExpireTimer()
+}
+
 // This rolls to a new append msg block.
 // Lock should be held.
 func (fs *fileStore) newMsgBlockForWrite() (*msgBlock, error) {
+	var mbuf []byte
 	index := uint64(1)
-	if fs.lmb != nil {
-		index = fs.lmb.index + 1
+	if lmb := fs.lmb; lmb != nil {
+		index = lmb.index + 1
+
+		// Determine if we can reclaim resources here.
+		if fs.fip {
+			// Reset write timestamp and see if we can expire this cache.
+			lmb.mu.Lock()
+			lmb.closeFDsLocked()
+			lmb.lwts = 0
+			mbuf = lmb.expireCacheLocked()
+			lmb.mu.Unlock()
+		}
 	}
 
 	mb := &msgBlock{fs: fs, index: index, cexp: fs.fcfg.CacheExpire}
+	mb.setupWriteCache(mbuf)
 
 	// Now do local hash.
 	key := sha256.Sum256(fs.hashKeyForBlock(index))
@@ -791,7 +787,10 @@ func (fs *fileStore) newMsgBlockForWrite() (*msgBlock, error) {
 
 	// Set cache time to creation time to start.
 	ts := time.Now().UnixNano()
-	mb.llts, mb.lrts, mb.lwts = ts, ts, ts
+	// Race detector wants these protected.
+	mb.mu.Lock()
+	mb.llts, mb.lwts = ts, ts
+	mb.mu.Unlock()
 
 	// Remember our last sequence number.
 	mb.first.seq = fs.state.LastSeq + 1
@@ -852,7 +851,10 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts in
 
 	// Check sequence.
 	if seq != fs.state.LastSeq+1 {
-		return ErrSequenceMismatch
+		if seq > 0 {
+			return ErrSequenceMismatch
+		}
+		seq = fs.state.LastSeq + 1
 	}
 
 	// Write msg record.
@@ -1121,8 +1123,7 @@ func (fs *fileStore) removeMsg(seq uint64, secure bool) (bool, error) {
 	mb.msgs--
 	mb.bytes -= msz
 
-	var shouldWriteIndex bool
-	var firstSeqNeedsUpdate bool
+	var shouldWriteIndex, firstSeqNeedsUpdate bool
 
 	if secure {
 		mb.eraseMsg(seq, int(ri), int(rl))
@@ -1230,16 +1231,16 @@ func (fs *fileStore) isClosed() bool {
 // Will spin up our flush loop.
 func (mb *msgBlock) spinUpFlushLoop() {
 	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
 	// Are we already running?
 	if mb.flusher {
-		mb.mu.Unlock()
 		return
 	}
 	mb.flusher = true
 	mb.fch = make(chan struct{}, 1)
 	mb.qch = make(chan struct{})
 	fch, qch := mb.fch, mb.qch
-	mb.mu.Unlock()
 
 	go mb.flushLoop(fch, qch)
 }
@@ -1317,6 +1318,16 @@ func (mb *msgBlock) flushLoop(fch, qch chan struct{}) {
 					ts *= 2
 				}
 				mb.flushPendingMsgs()
+				// Check if we are no longer the last message block. If we are
+				// not we can close FDs and exit.
+				mb.fs.mu.RLock()
+				notLast := mb != mb.fs.lmb
+				mb.fs.mu.RUnlock()
+				if notLast {
+					if err := mb.closeFDs(); err == nil {
+						return
+					}
+				}
 			}
 			if infoChanged() {
 				mb.writeIndexInfo()
@@ -1427,6 +1438,7 @@ func (mb *msgBlock) truncate(sm *fileStoredMsg) (nmsgs, nbytes uint64, err error
 		mb.mfd.ReadAt(lchk[:], eof-8)
 		copy(mb.lchk[0:], lchk[:])
 	} else {
+		mb.mu.Unlock()
 		return 0, 0, fmt.Errorf("failed to truncate msg block %d, file not open", mb.index)
 	}
 
@@ -1556,19 +1568,22 @@ func (mb *msgBlock) clearCache() {
 func (mb *msgBlock) expireCache() {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
+	mb.expireCacheLocked()
+}
 
+func (mb *msgBlock) expireCacheLocked() []byte {
 	if mb.cache == nil {
 		if mb.ctmr != nil {
 			mb.ctmr.Stop()
 			mb.ctmr = nil
 		}
-		return
+		return nil
 	}
 
 	// Can't expire if we are flushing or still have pending.
 	if mb.cache.flush || (len(mb.cache.buf)-int(mb.cache.wp) > 0) {
 		mb.resetCacheExpireTimer(mb.cexp)
-		return
+		return nil
 	}
 
 	// Grab timestamp to compare.
@@ -1583,11 +1598,12 @@ func (mb *msgBlock) expireCache() {
 	// Check for activity on the cache that would prevent us from expiring.
 	if tns-bufts <= int64(mb.cexp) {
 		mb.resetCacheExpireTimer(mb.cexp - time.Duration(tns-bufts))
-		return
+		return nil
 	}
 
 	// If we are here we will at least expire the core msg buffer.
 	// We need to capture offset in case we do a write next before a full load.
+	buf := mb.cache.buf
 	mb.cache.off += len(mb.cache.buf)
 	mb.cache.buf = nil
 	mb.cache.wp = 0
@@ -1599,6 +1615,8 @@ func (mb *msgBlock) expireCache() {
 	} else {
 		mb.resetCacheExpireTimer(mb.cexp)
 	}
+
+	return buf[:0]
 }
 
 func (fs *fileStore) startAgeChk() {
@@ -1689,21 +1707,9 @@ func (fs *fileStore) checkMsgs() *LostStreamData {
 // filestore lock will be held.
 func (mb *msgBlock) writeMsgRecord(rl, seq uint64, subj string, mhdr, msg []byte, ts int64, flush bool) error {
 	mb.mu.Lock()
-
 	// Make sure we have a cache setup.
 	if mb.cache == nil {
-		mb.cache = &cache{}
-		// Make sure we set the proper cache offset if we have existing data.
-		var fi os.FileInfo
-		if mb.mfd != nil {
-			fi, _ = mb.mfd.Stat()
-		} else {
-			fi, _ = os.Stat(mb.mfn)
-		}
-		if fi != nil {
-			mb.cache.off = int(fi.Size())
-		}
-		mb.startCacheExpireTimer()
+		mb.setupWriteCache(nil)
 	}
 
 	// Indexing
@@ -1782,7 +1788,9 @@ func (mb *msgBlock) writeMsgRecord(rl, seq uint64, subj string, mhdr, msg []byte
 			return err
 		}
 		if writeIndex {
-			mb.writeIndexInfo()
+			if err := mb.writeIndexInfo(); err != nil {
+				return err
+			}
 		}
 	} else {
 		// Kick the flusher here.
@@ -1818,6 +1826,28 @@ func (mb *msgBlock) setFlushing() {
 	if mb.cache != nil {
 		mb.cache.flush = true
 	}
+}
+
+// Try to close our FDs if we can.
+func (mb *msgBlock) closeFDs() error {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	return mb.closeFDsLocked()
+}
+
+func (mb *msgBlock) closeFDsLocked() error {
+	if buf, err := mb.bytesPending(); err == errFlushRunning || len(buf) > 0 {
+		return errPendingData
+	}
+	if mb.mfd != nil {
+		mb.mfd.Close()
+		mb.mfd = nil
+	}
+	if mb.ifd != nil {
+		mb.ifd.Close()
+		mb.ifd = nil
+	}
+	return nil
 }
 
 // bytesPending returns the buffer to be used for writing to the underlying file.
@@ -1989,6 +2019,9 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 	lbuf := uint32(len(buf))
 
 	for index < lbuf {
+		if index+msgHdrSize >= lbuf {
+			return errCorruptState
+		}
 		hdr := buf[index : index+msgHdrSize]
 		rl := le.Uint32(hdr[0:])
 		seq := le.Uint64(hdr[4:])
@@ -2003,7 +2036,7 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 		if dlen < 0 || int(slen) > dlen || dlen > int(rl) {
 			// This means something is off.
 			// TODO(dlc) - Add into bad list?
-			return errBadMsg
+			return errCorruptState
 		}
 		// Clear erase bit.
 		seq = seq &^ ebit
@@ -2064,6 +2097,10 @@ func (mb *msgBlock) flushPendingMsgs() error {
 	// If we got an error back return here.
 	if err != nil {
 		mb.mu.Unlock()
+		// No pending data to be written is not an error.
+		if err == errNoPending {
+			err = nil
+		}
 		return err
 	}
 
@@ -2075,9 +2112,7 @@ func (mb *msgBlock) flushPendingMsgs() error {
 	mfd := mb.mfd
 	mb.mu.Unlock()
 
-	var tn int
-
-	var n int
+	var n, tn int
 
 	// Append new data to the message block file.
 	for lbb := lob; lbb > 0; lbb = len(buf) {
@@ -2085,11 +2120,15 @@ func (mb *msgBlock) flushPendingMsgs() error {
 		if err != nil {
 			mb.removeIndexFile()
 			mb.dirtyClose()
-			if ld, err := mb.rebuildState(); err != nil && ld != nil {
-				// Rebuild fs state too.
-				mb.fs.rebuildState(ld)
+			if !isOutOfSpaceErr(err) {
+				if ld, err := mb.rebuildState(); err != nil && ld != nil {
+					// Rebuild fs state too.
+					mb.fs.mu.Lock()
+					mb.fs.rebuildState(ld)
+					mb.fs.mu.Unlock()
+				}
 			}
-			break
+			return err
 		}
 
 		woff += int64(n)
@@ -2169,7 +2208,14 @@ func (mb *msgBlock) loadMsgs() error {
 	mb.loading = true
 	defer mb.clearLoading()
 
+	var nchecks int
+
 checkCache:
+	nchecks++
+	if nchecks > 8 {
+		return errCorruptState
+	}
+
 	// Check to see if we have a full cache.
 	if mb.cache != nil && len(mb.cache.idx) == int(mb.msgs) && mb.cache.off == 0 && len(mb.cache.buf) > 0 {
 		return nil
@@ -2201,7 +2247,21 @@ checkCache:
 	mb.clearCacheAndOffset()
 
 	if err := mb.indexCacheBuf(buf); err != nil {
-		return err
+		if err == errCorruptState {
+			fs := mb.fs
+			mb.mu.Unlock()
+			var ld *LostStreamData
+			if ld, err = mb.rebuildState(); ld != nil {
+				fs.mu.Lock()
+				fs.rebuildState(ld)
+				fs.mu.Unlock()
+			}
+			mb.mu.Lock()
+		}
+		if err != nil {
+			return err
+		}
+		goto checkCache
 	}
 
 	if len(buf) > 0 {
@@ -2239,6 +2299,7 @@ var (
 	errNotReadable  = errors.New("storage directory not readable")
 	errFlushRunning = errors.New("flush is already running")
 	errCorruptState = errors.New("corrupt state file")
+	errPendingData  = errors.New("pending data still present")
 )
 
 // Used for marking messages that have had their checksums checked.
@@ -2285,6 +2346,7 @@ func (mb *msgBlock) cacheLookupWithLock(seq uint64) (*fileStoredMsg, error) {
 
 	// Update cache activity.
 	mb.llts = time.Now().UnixNano()
+	mb.llseq = seq
 
 	// We use the high bit to denote we have already checked the checksum.
 	var hh hash.Hash64
@@ -2313,6 +2375,7 @@ func (mb *msgBlock) cacheLookupWithLock(seq uint64) (*fileStoredMsg, error) {
 		mb:   mb,
 		off:  int64(bi),
 	}
+
 	return sm, nil
 }
 
@@ -2331,7 +2394,7 @@ func (fs *fileStore) msgForSeq(seq uint64) (*fileStoredMsg, error) {
 	}
 	// Make sure to snapshot here.
 	lseq := fs.state.LastSeq
-	mb := fs.selectMsgBlock(seq)
+	mb, lmb := fs.selectMsgBlock(seq), fs.lmb
 	fs.mu.RUnlock()
 
 	if mb == nil {
@@ -2341,10 +2404,31 @@ func (fs *fileStore) msgForSeq(seq uint64) (*fileStoredMsg, error) {
 		}
 		return nil, err
 	}
+
+	// Check to see if we are the last seq for this message block and are doing
+	// a linear scan. If that is true and we are not the last message block we can
+	// expire try to expire the cache.
+	mb.mu.RLock()
+	shouldTryExpire := mb != lmb && seq == mb.last.seq && mb.llseq == seq-1
+	mb.mu.RUnlock()
+
 	// TODO(dlc) - older design had a check to prefetch when we knew we were
 	// loading in order and getting close to end of current mb. Should add
 	// something like it back in.
-	return mb.fetchMsg(seq)
+	fsm, err := mb.fetchMsg(seq)
+	if err != nil {
+		return nil, err
+	}
+
+	// We detected a linear scan and access to the last message.
+	if shouldTryExpire {
+		mb.mu.Lock()
+		mb.llts = 0
+		mb.expireCacheLocked()
+		mb.mu.Unlock()
+	}
+
+	return fsm, nil
 }
 
 // Internal function to return msg parts from a raw buffer.
@@ -2408,6 +2492,22 @@ func (fs *fileStore) LoadMsg(seq uint64) (string, []byte, []byte, int64, error) 
 		return sm.subj, sm.hdr, sm.msg, sm.ts, nil
 	}
 	return "", nil, nil, 0, err
+}
+
+// Type returns the type of the underlying store.
+func (fs *fileStore) Type() StorageType {
+	return FileStorage
+}
+
+// FastState will fill in state with only the following.
+// Msgs, Bytes, FirstSeq, LastSeq
+func (fs *fileStore) FastState(state *StreamState) {
+	fs.mu.RLock()
+	state.Msgs = fs.state.Msgs
+	state.Bytes = fs.state.Bytes
+	state.FirstSeq = fs.state.FirstSeq
+	state.LastSeq = fs.state.LastSeq
+	fs.mu.RUnlock()
 }
 
 // State returns the current state of the stream.
@@ -2645,6 +2745,10 @@ func (fs *fileStore) dmapEntries() int {
 // Purge will remove all messages from this store.
 // Will return the number of purged messages.
 func (fs *fileStore) Purge() (uint64, error) {
+	return fs.purge(0)
+}
+
+func (fs *fileStore) purge(fseq uint64) (uint64, error) {
 	fs.mu.Lock()
 	if fs.closed {
 		fs.mu.Unlock()
@@ -2687,6 +2791,11 @@ func (fs *fileStore) Purge() (uint64, error) {
 		return purged, err
 	}
 
+	// Check if we need to set the first seq to a new number.
+	if fseq > fs.state.FirstSeq {
+		fs.state.FirstSeq = fseq
+		fs.state.LastSeq = fseq - 1
+	}
 	fs.lmb.first.seq = fs.state.FirstSeq
 	fs.lmb.last.seq = fs.state.LastSeq
 	fs.lmb.writeIndexInfo()
@@ -2705,33 +2814,62 @@ func (fs *fileStore) Purge() (uint64, error) {
 // but not including the seq parameter.
 // Will return the number of purged messages.
 func (fs *fileStore) Compact(seq uint64) (uint64, error) {
-	if seq == 0 {
-		return fs.Purge()
+	if seq == 0 || seq > fs.lastSeq() {
+		return fs.purge(seq)
 	}
 
-	// TODO(dlc) - We can be smarter for large compactions and drop whole msg blocks.
 	var purged uint64
-	if last := fs.lastSeq(); seq <= last {
-		for fseq := fs.firstSeq(); fseq < seq; fseq = fs.firstSeq() {
-			if found, err := fs.removeMsg(fseq, false); err != nil {
-				if err == ErrStoreMsgNotFound {
-					continue
-				} else if err == ErrStoreEOF {
-					err = nil
-				}
-				return purged, err
-			} else if found {
-				purged++
-			}
+	var bytes uint64
+
+	// We have to delete interior messages.
+	fs.mu.Lock()
+	smb := fs.selectMsgBlock(seq)
+	if smb == nil {
+		fs.mu.Unlock()
+		return 0, nil
+	}
+	// All msgblocks up to this one can be thrown away.
+	for i, mb := range fs.blks {
+		if mb == smb {
+			fs.blks = append(fs.blks[:0:0], fs.blks[i:]...)
+			break
 		}
-	} else {
-		// We are compacting past the end of our range. Do purge and set sequences correctly
-		// such that the next message placed will have seq.
-		var err error
-		if purged, err = fs.Purge(); err != nil {
-			return 0, err
+		mb.mu.Lock()
+		purged += mb.msgs
+		bytes += mb.bytes
+		mb.dirtyCloseWithRemove(true)
+		mb.mu.Unlock()
+	}
+	fs.mu.Unlock()
+
+	if err := smb.loadMsgs(); err != nil {
+		return purged, err
+	}
+
+	smb.mu.Lock()
+	for mseq := smb.first.seq; mseq < seq; mseq++ {
+		if _, rl, _, err := smb.slotInfo(int(mseq - smb.cache.fseq)); err != nil {
+			smb.bytes -= uint64(rl)
 		}
-		fs.resetFirst(seq)
+		smb.msgs--
+		purged++
+	}
+	// Update first entry.
+	sm, _ := smb.cacheLookupWithLock(seq)
+	if sm != nil {
+		smb.first.seq = sm.seq
+		smb.first.ts = sm.ts
+	}
+	smb.mu.Unlock()
+
+	if sm != nil {
+		// Reset our version of first.
+		fs.mu.Lock()
+		fs.state.FirstSeq = sm.seq
+		fs.state.FirstTime = time.Unix(0, sm.ts).UTC()
+		fs.state.Msgs -= purged
+		fs.state.Bytes -= bytes
+		fs.mu.Unlock()
 	}
 
 	return purged, nil
@@ -2804,23 +2942,6 @@ func (fs *fileStore) Truncate(seq uint64) error {
 	return nil
 }
 
-func (fs *fileStore) resetFirst(newFirst uint64) {
-	fs.mu.Lock()
-	fs.state.FirstSeq = newFirst
-	fs.state.LastSeq = newFirst - 1
-	fs.lmb.first.seq = fs.state.FirstSeq
-	fs.lmb.last.seq = fs.state.LastSeq
-	fs.lmb.writeIndexInfo()
-	fs.mu.Unlock()
-}
-
-func (fs *fileStore) firstSeq() uint64 {
-	fs.mu.RLock()
-	seq := fs.state.FirstSeq
-	fs.mu.RUnlock()
-	return seq
-}
-
 func (fs *fileStore) lastSeq() uint64 {
 	fs.mu.RLock()
 	seq := fs.state.LastSeq
@@ -2856,22 +2977,26 @@ func (fs *fileStore) removeMsgBlock(mb *msgBlock) {
 	// Remove from list.
 	for i, omb := range fs.blks {
 		if mb == omb {
-			fs.blks = append(fs.blks[:i], fs.blks[i+1:]...)
+			blks := append(fs.blks[:i], fs.blks[i+1:]...)
+			fs.blks = append(blks[:0:0], blks...)
 			break
 		}
 	}
 	// Check for us being last message block
 	if mb == fs.lmb {
+		// Creating a new message write block requires that the lmb lock is not held.
+		mb.mu.Unlock()
 		fs.newMsgBlockForWrite()
+		mb.mu.Lock()
 	}
 }
 
-// Called by purge to simply get rid of the cache and close and fds.
+// Called by purge to simply get rid of the cache and close our fds.
 // Lock should not be held.
 func (mb *msgBlock) dirtyClose() {
 	mb.mu.Lock()
+	defer mb.mu.Unlock()
 	mb.dirtyCloseWithRemove(false)
-	mb.mu.Unlock()
 }
 
 // Should be called with lock held.
@@ -2960,7 +3085,7 @@ func (fs *fileStore) Stop() error {
 	fs.lmb = nil
 
 	fs.checkAndFlushAllBlocks()
-	fs.closeAllMsgBlocks(true)
+	fs.closeAllMsgBlocks(false)
 
 	if fs.syncTmr != nil {
 		fs.syncTmr.Stop()
@@ -3299,7 +3424,7 @@ func (o *consumerFileStore) flushLoop() {
 	for {
 		select {
 		case <-fch:
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			select {
 			case <-qch:
 				return
@@ -3448,8 +3573,6 @@ func encodeConsumerState(state *ConsumerState) []byte {
 		buf = make([]byte, maxSize)
 	}
 
-	now := time.Now()
-
 	// Write header
 	buf[0] = magic
 	buf[1] = 2
@@ -3467,7 +3590,7 @@ func encodeConsumerState(state *ConsumerState) []byte {
 	// These are optional, but always write len. This is to avoid a truncate inline.
 	if len(state.Pending) > 0 {
 		// To save space we will use now rounded to seconds to be base timestamp.
-		mints := now.Round(time.Second).Unix()
+		mints := time.Now().Round(time.Second).Unix()
 		// Write minimum timestamp we found from above.
 		n += binary.PutVarint(buf[n:], mints)
 
@@ -3820,25 +3943,23 @@ func (o *consumerFileStore) Stop() error {
 		o.qch = nil
 	}
 
-	err := o.ensureStateFileOpen()
-	ifd := o.ifd
-
-	if err == nil {
-		var buf []byte
-		// Make sure to write this out..
-		if buf, err = o.encodeState(); err == nil {
-			_, err = ifd.WriteAt(buf, 0)
+	var err error
+	if !o.writing {
+		if err = o.ensureStateFileOpen(); err == nil {
+			var buf []byte
+			// Make sure to write this out..
+			if buf, err = o.encodeState(); err == nil && len(buf) > 0 {
+				_, err = o.ifd.WriteAt(buf, 0)
+			}
 		}
 	}
 
 	o.ifd, o.odir = nil, _EMPTY_
-	fs := o.fs
+	fs, ifd := o.fs, o.ifd
 	o.closed = true
-	o.kickFlusher()
 	o.mu.Unlock()
 
 	if ifd != nil {
-		ifd.Sync()
 		ifd.Close()
 	}
 

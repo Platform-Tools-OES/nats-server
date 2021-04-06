@@ -1619,6 +1619,141 @@ func TestLeafNodeTLSVerifyAndMap(t *testing.T) {
 	}
 }
 
+type chanLogger struct {
+	DummyLogger
+	triggerChan chan string
+}
+
+func (l *chanLogger) Warnf(format string, v ...interface{}) {
+	l.triggerChan <- fmt.Sprintf(format, v...)
+}
+
+func (l *chanLogger) Errorf(format string, v ...interface{}) {
+	l.triggerChan <- fmt.Sprintf(format, v...)
+}
+
+const (
+	testLeafNodeTLSVerifyAndMapSrvA = `
+listen: 127.0.0.1:-1
+leaf {
+	listen: "127.0.0.1:-1"
+	tls {
+		cert_file: "../test/configs/certs/server-cert.pem"
+		key_file:  "../test/configs/certs/server-key.pem"
+		ca_file:   "../test/configs/certs/ca.pem"
+		timeout: 2
+		verify_and_map: true
+	}
+	authorization {
+		users [{
+			user: "%s"
+		}]
+	}
+}
+`
+	testLeafNodeTLSVerifyAndMapSrvB = `
+listen: -1
+leaf {
+	remotes [
+		{
+			url: "tls://user-provided-in-url@localhost:%d"
+			tls {
+				cert_file: "../test/configs/certs/server-cert.pem"
+				key_file:  "../test/configs/certs/server-key.pem"
+				ca_file:   "../test/configs/certs/ca.pem"
+			}
+		}
+	]
+}`
+)
+
+func TestLeafNodeTLSVerifyAndMapCfgPass(t *testing.T) {
+	l := &chanLogger{triggerChan: make(chan string, 100)}
+	defer close(l.triggerChan)
+
+	confA := createConfFile(t, []byte(fmt.Sprintf(testLeafNodeTLSVerifyAndMapSrvA, "localhost")))
+	defer os.Remove(confA)
+	srvA, optsA := RunServerWithConfig(confA)
+	defer srvA.Shutdown()
+	srvA.SetLogger(l, true, true)
+
+	confB := createConfFile(t, []byte(fmt.Sprintf(testLeafNodeTLSVerifyAndMapSrvB, optsA.LeafNode.Port)))
+	defer os.Remove(confB)
+	ob := LoadConfig(confB)
+	ob.LeafNode.ReconnectInterval = 50 * time.Millisecond
+	srvB := RunServer(ob)
+	defer srvB.Shutdown()
+
+	// Now make sure that the leaf node connection is up and the correct account was picked
+	checkFor(t, 10*time.Second, 10*time.Millisecond, func() error {
+		for _, srv := range []*Server{srvA, srvB} {
+			if nln := srv.NumLeafNodes(); nln != 1 {
+				return fmt.Errorf("Number of leaf nodes is %d", nln)
+			}
+			if leafz, err := srv.Leafz(nil); err != nil {
+				if len(leafz.Leafs) != 1 {
+					return fmt.Errorf("Number of leaf nodes returned by LEAFZ is not one: %d", len(leafz.Leafs))
+				} else if leafz.Leafs[0].Account != DEFAULT_GLOBAL_ACCOUNT {
+					return fmt.Errorf("Account used is not $G: %s", leafz.Leafs[0].Account)
+				}
+			}
+		}
+		return nil
+	})
+	// Make sure that the user name in the url was ignored and a warning printed
+	for {
+		select {
+		case w := <-l.triggerChan:
+			if w == `User "user-provided-in-url" found in connect proto, but user required from cert` {
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Did not get expected warning")
+		}
+	}
+}
+
+func TestLeafNodeTLSVerifyAndMapCfgFail(t *testing.T) {
+	l := &chanLogger{triggerChan: make(chan string, 100)}
+	defer close(l.triggerChan)
+
+	// use certificate with SAN localhost, but configure the server to not accept it
+	// instead provide a name matching the user (to be matched by failed
+	confA := createConfFile(t, []byte(fmt.Sprintf(testLeafNodeTLSVerifyAndMapSrvA, "user-provided-in-url")))
+	defer os.Remove(confA)
+	srvA, optsA := RunServerWithConfig(confA)
+	defer srvA.Shutdown()
+	srvA.SetLogger(l, true, true)
+
+	confB := createConfFile(t, []byte(fmt.Sprintf(testLeafNodeTLSVerifyAndMapSrvB, optsA.LeafNode.Port)))
+	defer os.Remove(confB)
+	ob := LoadConfig(confB)
+	ob.LeafNode.ReconnectInterval = 50 * time.Millisecond
+	srvB := RunServer(ob)
+	defer srvB.Shutdown()
+
+	// Now make sure that the leaf node connection is down
+	checkFor(t, 10*time.Second, 10*time.Millisecond, func() error {
+		for _, srv := range []*Server{srvA, srvB} {
+			if nln := srv.NumLeafNodes(); nln != 0 {
+				return fmt.Errorf("Number of leaf nodes is %d", nln)
+			}
+		}
+		return nil
+	})
+	// Make sure that the connection was closed for the right reason
+	for {
+		select {
+		case w := <-l.triggerChan:
+			if strings.Contains(w, ErrAuthentication.Error()) {
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Did not get expected warning")
+		}
+	}
+}
+
 func TestLeafNodeOriginClusterInfo(t *testing.T) {
 	hopts := DefaultOptions()
 	hopts.ServerName = "hub"
@@ -2824,4 +2959,329 @@ func TestLeafNodeWSGossip(t *testing.T) {
 	if !isWS {
 		t.Fatal("Leafnode connection is not websocket!")
 	}
+}
+
+// This test was showing an issue if one set maxBufSize to very small value,
+// such as maxBufSize = 10. With such small value, we would get a corruption
+// in that LMSG would arrive with missing bytes. We are now always making
+// a copy when dealing with messages that are bigger than maxBufSize.
+func TestLeafNodeWSNoBufferCorruption(t *testing.T) {
+	o := testDefaultLeafNodeWSOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	lo1 := testDefaultRemoteLeafNodeWSOptions(t, o, false)
+	lo1.LeafNode.ReconnectInterval = 15 * time.Millisecond
+	ln1 := RunServer(lo1)
+	defer ln1.Shutdown()
+
+	lo2 := DefaultOptions()
+	lo2.Cluster.Name = "LN"
+	lo2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", lo1.Cluster.Port))
+	ln2 := RunServer(lo2)
+	defer ln2.Shutdown()
+
+	checkClusterFormed(t, ln1, ln2)
+
+	checkLeafNodeConnected(t, s)
+	checkLeafNodeConnected(t, ln1)
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	sub := natsSubSync(t, nc, "foo")
+
+	nc1 := natsConnect(t, ln1.ClientURL())
+	defer nc1.Close()
+
+	nc2 := natsConnect(t, ln2.ClientURL())
+	defer nc2.Close()
+	sub2 := natsSubSync(t, nc2, "foo")
+
+	checkSubInterest(t, s, globalAccountName, "foo", time.Second)
+	checkSubInterest(t, ln2, globalAccountName, "foo", time.Second)
+	checkSubInterest(t, ln1, globalAccountName, "foo", time.Second)
+
+	payload := make([]byte, 100*1024)
+	for i := 0; i < len(payload); i++ {
+		payload[i] = 'A'
+	}
+	natsPub(t, nc1, "foo", payload)
+
+	checkMsgRcv := func(sub *nats.Subscription) {
+		msg := natsNexMsg(t, sub, time.Second)
+		if !bytes.Equal(msg.Data, payload) {
+			t.Fatalf("Invalid message content: %q", msg.Data)
+		}
+	}
+	checkMsgRcv(sub2)
+	checkMsgRcv(sub)
+}
+
+func TestLeafNodeStreamImport(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.LeafNode.Port = -1
+	accA := NewAccount("A")
+	o1.Accounts = []*Account{accA}
+	o1.Users = []*User{&User{Username: "a", Password: "a", Account: accA}}
+	o1.LeafNode.Account = "A"
+	o1.NoAuthUser = "a"
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	o2 := DefaultOptions()
+	o2.LeafNode.Port = -1
+
+	accB := NewAccount("B")
+	if err := accB.AddStreamExport(">", nil); err != nil {
+		t.Fatalf("Error adding stream export: %v", err)
+	}
+
+	accC := NewAccount("C")
+	if err := accC.AddStreamImport(accB, ">", ""); err != nil {
+		t.Fatalf("Error adding stream import: %v", err)
+	}
+
+	o2.Accounts = []*Account{accB, accC}
+	o2.Users = []*User{&User{Username: "b", Password: "b", Account: accB}, &User{Username: "c", Password: "c", Account: accC}}
+	o2.NoAuthUser = "b"
+	u, err := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", o1.LeafNode.Port))
+	if err != nil {
+		t.Fatalf("Error parsing url: %v", err)
+	}
+	o2.LeafNode.Remotes = []*RemoteLeafOpts{&RemoteLeafOpts{URLs: []*url.URL{u}, LocalAccount: "C"}}
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	nc1 := natsConnect(t, s1.ClientURL())
+	defer nc1.Close()
+
+	sub := natsSubSync(t, nc1, "a")
+
+	checkSubInterest(t, s2, "C", "a", time.Second)
+
+	nc2 := natsConnect(t, s2.ClientURL())
+	defer nc2.Close()
+
+	natsPub(t, nc2, "a", []byte("hello?"))
+
+	natsNexMsg(t, sub, time.Second)
+}
+
+func TestLeafNodeRouteSubWithOrigin(t *testing.T) {
+	lo1 := DefaultOptions()
+	lo1.LeafNode.Host = "127.0.0.1"
+	lo1.LeafNode.Port = -1
+	lo1.Cluster.Name = "local"
+	lo1.Cluster.Host = "127.0.0.1"
+	lo1.Cluster.Port = -1
+	l1 := RunServer(lo1)
+	defer l1.Shutdown()
+
+	lo2 := DefaultOptions()
+	lo2.LeafNode.Host = "127.0.0.1"
+	lo2.LeafNode.Port = -1
+	lo2.Cluster.Name = "local"
+	lo2.Cluster.Host = "127.0.0.1"
+	lo2.Cluster.Port = -1
+	lo2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", lo1.Cluster.Port))
+	l2 := RunServer(lo2)
+	defer l2.Shutdown()
+
+	checkClusterFormed(t, l1, l2)
+
+	u1, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", lo1.LeafNode.Port))
+	urls := []*url.URL{u1}
+
+	ro1 := DefaultOptions()
+	ro1.Cluster.Name = "remote"
+	ro1.Cluster.Host = "127.0.0.1"
+	ro1.Cluster.Port = -1
+	ro1.LeafNode.ReconnectInterval = 50 * time.Millisecond
+	ro1.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: urls}}
+	r1 := RunServer(ro1)
+	defer r1.Shutdown()
+
+	checkLeafNodeConnected(t, r1)
+
+	nc := natsConnect(t, r1.ClientURL(), nats.NoReconnect())
+	defer nc.Close()
+	natsSubSync(t, nc, "foo")
+	natsQueueSubSync(t, nc, "bar", "baz")
+	checkSubInterest(t, l2, globalAccountName, "foo", time.Second)
+	checkSubInterest(t, l2, globalAccountName, "bar", time.Second)
+
+	// Now shutdown the leafnode and check that any subscription for $G on l2 are gone.
+	r1.Shutdown()
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		acc := l2.GlobalAccount()
+		if n := acc.TotalSubs(); n != 0 {
+			return fmt.Errorf("Account %q should have 0 sub, got %v", acc.GetName(), n)
+		}
+		return nil
+	})
+}
+
+func TestLeafNodeLoopDetectionWithMultipleClusters(t *testing.T) {
+	lo1 := DefaultOptions()
+	lo1.LeafNode.Host = "127.0.0.1"
+	lo1.LeafNode.Port = -1
+	lo1.Cluster.Name = "local"
+	lo1.Cluster.Host = "127.0.0.1"
+	lo1.Cluster.Port = -1
+	l1 := RunServer(lo1)
+	defer l1.Shutdown()
+
+	lo2 := DefaultOptions()
+	lo2.LeafNode.Host = "127.0.0.1"
+	lo2.LeafNode.Port = -1
+	lo2.Cluster.Name = "local"
+	lo2.Cluster.Host = "127.0.0.1"
+	lo2.Cluster.Port = -1
+	lo2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", lo1.Cluster.Port))
+	l2 := RunServer(lo2)
+	defer l2.Shutdown()
+
+	checkClusterFormed(t, l1, l2)
+
+	u1, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", lo1.LeafNode.Port))
+	u2, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", lo2.LeafNode.Port))
+	urls := []*url.URL{u1, u2}
+
+	ro1 := DefaultOptions()
+	ro1.Cluster.Name = "remote"
+	ro1.Cluster.Host = "127.0.0.1"
+	ro1.Cluster.Port = -1
+	ro1.LeafNode.ReconnectInterval = 50 * time.Millisecond
+	ro1.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: urls}}
+	r1 := RunServer(ro1)
+	defer r1.Shutdown()
+
+	l := &captureErrorLogger{errCh: make(chan string, 100)}
+	r1.SetLogger(l, false, false)
+
+	ro2 := DefaultOptions()
+	ro2.Cluster.Name = "remote"
+	ro2.Cluster.Host = "127.0.0.1"
+	ro2.Cluster.Port = -1
+	ro2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", ro1.Cluster.Port))
+	ro2.LeafNode.ReconnectInterval = 50 * time.Millisecond
+	ro2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: urls}}
+	r2 := RunServer(ro2)
+	defer r2.Shutdown()
+
+	checkClusterFormed(t, r1, r2)
+	checkLeafNodeConnected(t, r1)
+	checkLeafNodeConnected(t, r2)
+
+	l1.Shutdown()
+
+	// Now wait for r1 and r2 to reconnect, they should not have a problem of loop detection.
+	checkLeafNodeConnected(t, r1)
+	checkLeafNodeConnected(t, r2)
+
+	// Wait and make sure we don't have a loop error
+	timeout := time.NewTimer(500 * time.Millisecond)
+	for {
+		select {
+		case err := <-l.errCh:
+			if strings.Contains(err, "Loop detected") {
+				t.Fatal(err)
+			}
+		case <-timeout.C:
+			// OK, we are done.
+			return
+		}
+	}
+}
+
+func TestLeafNodeUnsubOnRouteDisconnect(t *testing.T) {
+	lo1 := DefaultOptions()
+	lo1.LeafNode.Host = "127.0.0.1"
+	lo1.LeafNode.Port = -1
+	lo1.Cluster.Name = "local"
+	lo1.Cluster.Host = "127.0.0.1"
+	lo1.Cluster.Port = -1
+	l1 := RunServer(lo1)
+	defer l1.Shutdown()
+
+	lo2 := DefaultOptions()
+	lo2.LeafNode.Host = "127.0.0.1"
+	lo2.LeafNode.Port = -1
+	lo2.Cluster.Name = "local"
+	lo2.Cluster.Host = "127.0.0.1"
+	lo2.Cluster.Port = -1
+	lo2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", lo1.Cluster.Port))
+	l2 := RunServer(lo2)
+	defer l2.Shutdown()
+
+	checkClusterFormed(t, l1, l2)
+
+	u1, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", lo1.LeafNode.Port))
+	u2, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", lo2.LeafNode.Port))
+	urls := []*url.URL{u1, u2}
+
+	ro1 := DefaultOptions()
+	// DefaultOptions sets a cluster name, so make sure they are different.
+	// Also, we don't have r1 and r2 clustered in this test, so set port to 0.
+	ro1.Cluster.Name = _EMPTY_
+	ro1.Cluster.Port = 0
+	ro1.LeafNode.ReconnectInterval = 50 * time.Millisecond
+	ro1.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: urls}}
+	r1 := RunServer(ro1)
+	defer r1.Shutdown()
+
+	ro2 := DefaultOptions()
+	ro1.Cluster.Name = _EMPTY_
+	ro2.Cluster.Port = 0
+	ro2.LeafNode.ReconnectInterval = 50 * time.Millisecond
+	// Have this one point only to l2
+	ro2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u2}}}
+	r2 := RunServer(ro2)
+	defer r2.Shutdown()
+
+	checkLeafNodeConnected(t, r1)
+	checkLeafNodeConnected(t, r2)
+
+	// Create a subscription on r1.
+	nc := natsConnect(t, r1.ClientURL())
+	defer nc.Close()
+	sub := natsSubSync(t, nc, "foo")
+	natsFlush(t, nc)
+
+	checkSubInterest(t, l2, globalAccountName, "foo", time.Second)
+	checkSubInterest(t, r2, globalAccountName, "foo", time.Second)
+
+	nc2 := natsConnect(t, r2.ClientURL())
+	defer nc2.Close()
+	natsPub(t, nc, "foo", []byte("msg1"))
+
+	// Check message received
+	natsNexMsg(t, sub, time.Second)
+
+	// Now shutdown l1, l2 should update subscription interest to r2.
+	// When r1 reconnects to l2, subscription should be updated too.
+	l1.Shutdown()
+
+	// Wait a bit (so that the check of interest is not OK just because
+	// the route would not have been yet detected as broken), and check
+	// interest still present on r2, l2.
+	time.Sleep(100 * time.Millisecond)
+	checkSubInterest(t, l2, globalAccountName, "foo", time.Second)
+	checkSubInterest(t, r2, globalAccountName, "foo", time.Second)
+
+	// Check again that message received ok
+	natsPub(t, nc, "foo", []byte("msg2"))
+	natsNexMsg(t, sub, time.Second)
+
+	// Now close client. Interest should disappear on r2. Due to a bug,
+	// it was not.
+	nc.Close()
+
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		acc := r2.GlobalAccount()
+		if n := acc.Interest("foo"); n != 0 {
+			return fmt.Errorf("Still interest on subject: %v", n)
+		}
+		return nil
+	})
 }

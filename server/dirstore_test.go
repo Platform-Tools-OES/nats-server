@@ -1,18 +1,15 @@
-/*
- * Copyright 2020 The NATS Authors
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- */
+// Copyright 2012-2021 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -895,6 +892,10 @@ func TestRemove(t *testing.T) {
 				require_Len(t, len(f), 1)
 			}
 			dirStore, err := NewExpiringDirJWTStore(dir, false, false, deleteType, 0, 10, true, 0, nil)
+			delPubKey := ""
+			dirStore.deleted = func(publicKey string) {
+				delPubKey = publicKey
+			}
 			require_NoError(t, err)
 			defer dirStore.Close()
 			accountKey, err := nkeys.CreateAccount()
@@ -904,6 +905,11 @@ func TestRemove(t *testing.T) {
 			createTestAccount(t, dirStore, 0, accountKey)
 			require_OneJWT()
 			dirStore.delete(pubKey)
+			if deleteType == NoDelete {
+				require_True(t, delPubKey == "")
+			} else {
+				require_True(t, delPubKey == pubKey)
+			}
 			f, err := filepath.Glob(dir + string(os.PathSeparator) + "/*.jwt")
 			require_NoError(t, err)
 			require_Len(t, len(f), test.expected)

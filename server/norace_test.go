@@ -1324,7 +1324,7 @@ func TestNoRaceJetStreamWorkQueueLoadBalance(t *testing.T) {
 	}
 }
 
-func TestJetStreamClusterLargeStreamInlineCatchup(t *testing.T) {
+func TestNoRaceJetStreamClusterLargeStreamInlineCatchup(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "LSS", 3)
 	defer c.shutdown()
 
@@ -1373,7 +1373,7 @@ func TestJetStreamClusterLargeStreamInlineCatchup(t *testing.T) {
 	c.waitOnStreamCurrent(sr, "$G", "TEST")
 
 	// Ask other servers to stepdown as leader so that sr becomes the leader.
-	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
 		c.waitOnStreamLeader("$G", "TEST")
 		if sl := c.streamLeader("$G", "TEST"); sl != sr {
 			sl.JetStreamStepdownStream("$G", "TEST")
@@ -1396,8 +1396,8 @@ func TestJetStreamClusterLargeStreamInlineCatchup(t *testing.T) {
 	})
 }
 
-func TestJetStreamClusterStreamCreateAndLostQuorum(t *testing.T) {
-	c := createJetStreamClusterExplicit(t, "R5S", 5)
+func TestNoRaceJetStreamClusterStreamCreateAndLostQuorum(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 3)
 	defer c.shutdown()
 
 	// Client based API
@@ -1410,7 +1410,7 @@ func TestJetStreamClusterStreamCreateAndLostQuorum(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	if _, err := js.AddStream(&nats.StreamConfig{Name: "NO-LQ-START", Replicas: 5}); err != nil {
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "NO-LQ-START", Replicas: 3}); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	c.waitOnStreamLeader("$G", "NO-LQ-START")
@@ -1432,7 +1432,330 @@ func TestJetStreamClusterStreamCreateAndLostQuorum(t *testing.T) {
 	nc.Flush()
 
 	c.restartAll()
-
 	c.waitOnStreamLeader("$G", "NO-LQ-START")
+
 	checkSubsPending(t, sub, 0)
+}
+
+func TestNoRaceJetStreamClusterSuperClusterMirrors(t *testing.T) {
+	// These pass locally but are flaky on Travis.
+	// Disable for now.
+	skip(t)
+
+	sc := createJetStreamSuperCluster(t, 3, 3)
+	defer sc.shutdown()
+
+	// Client based API
+	s := sc.clusterForName("C2").randomServer()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Create source stream.
+	_, err := js.AddStream(&nats.StreamConfig{Name: "S1", Subjects: []string{"foo", "bar"}, Replicas: 3, Placement: &nats.Placement{Cluster: "C2"}})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Needed while Go client does not have mirror support.
+	createStream := func(cfg *nats.StreamConfig) {
+		t.Helper()
+		if _, err := js.AddStream(cfg); err != nil {
+			t.Fatalf("Unexpected error: %+v", err)
+		}
+	}
+
+	// Send 100 messages.
+	for i := 0; i < 100; i++ {
+		if _, err := js.Publish("foo", []byte("MIRRORS!")); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	createStream(&nats.StreamConfig{
+		Name:      "M1",
+		Mirror:    &nats.StreamSource{Name: "S1"},
+		Placement: &nats.Placement{Cluster: "C1"},
+	})
+
+	// Faster timeout since we loop below checking for condition.
+	js2, err := nc.JetStream(nats.MaxWait(50 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js2.StreamInfo("M1")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if si.State.Msgs != 100 {
+			return fmt.Errorf("Expected 100 msgs, got state: %+v", si.State)
+		}
+		return nil
+	})
+
+	// Purge the source stream.
+	if err := js.PurgeStream("S1"); err != nil {
+		t.Fatalf("Unexpected purge error: %v", err)
+	}
+	// Send 50 more msgs now.
+	for i := 0; i < 50; i++ {
+		if _, err := js.Publish("bar", []byte("OK")); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	createStream(&nats.StreamConfig{
+		Name:      "M2",
+		Mirror:    &nats.StreamSource{Name: "S1"},
+		Replicas:  3,
+		Placement: &nats.Placement{Cluster: "C3"},
+	})
+
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js2.StreamInfo("M2")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if si.State.Msgs != 50 {
+			return fmt.Errorf("Expected 50 msgs, got state: %+v", si.State)
+		}
+		if si.State.FirstSeq != 101 {
+			return fmt.Errorf("Expected start seq of 101, got state: %+v", si.State)
+		}
+		return nil
+	})
+
+	sl := sc.clusterForName("C3").streamLeader("$G", "M2")
+	doneCh := make(chan bool)
+
+	// Now test that if the mirror get's interrupted that it picks up where it left off etc.
+	go func() {
+		// Send 100 more messages.
+		for i := 0; i < 100; i++ {
+			if _, err := js.Publish("foo", []byte("MIRRORS!")); err != nil {
+				t.Errorf("Unexpected publish on %d error: %v", i, err)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		doneCh <- true
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	sl.Shutdown()
+
+	<-doneCh
+	sc.clusterForName("C3").waitOnStreamLeader("$G", "M2")
+
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js2.StreamInfo("M2")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if si.State.Msgs != 150 {
+			return fmt.Errorf("Expected 150 msgs, got state: %+v", si.State)
+		}
+		if si.State.FirstSeq != 101 {
+			return fmt.Errorf("Expected start seq of 101, got state: %+v", si.State)
+		}
+		return nil
+	})
+}
+
+func TestNoRaceJetStreamClusterSuperClusterSources(t *testing.T) {
+	// These pass locally but are flaky on Travis.
+	// Disable for now.
+	skip(t)
+
+	sc := createJetStreamSuperCluster(t, 3, 3)
+	defer sc.shutdown()
+
+	// Client based API
+	s := sc.clusterForName("C1").randomServer()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Create our source streams.
+	for _, sname := range []string{"foo", "bar", "baz"} {
+		if _, err := js.AddStream(&nats.StreamConfig{Name: sname, Replicas: 1}); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	sendBatch := func(subject string, n int) {
+		for i := 0; i < n; i++ {
+			msg := fmt.Sprintf("MSG-%d", i+1)
+			if _, err := js.Publish(subject, []byte(msg)); err != nil {
+				t.Fatalf("Unexpected publish error: %v", err)
+			}
+		}
+	}
+	// Populate each one.
+	sendBatch("foo", 10)
+	sendBatch("bar", 15)
+	sendBatch("baz", 25)
+
+	// Needed while Go client does not have mirror support for creating mirror or source streams.
+	createStream := func(cfg *nats.StreamConfig) {
+		t.Helper()
+		if _, err := js.AddStream(cfg); err != nil {
+			t.Fatalf("Unexpected error: %+v", err)
+		}
+	}
+
+	cfg := &nats.StreamConfig{
+		Name: "MS",
+		Sources: []*nats.StreamSource{
+			{Name: "foo"},
+			{Name: "bar"},
+			{Name: "baz"},
+		},
+	}
+
+	createStream(cfg)
+	time.Sleep(time.Second)
+
+	// Faster timeout since we loop below checking for condition.
+	js2, err := nc.JetStream(nats.MaxWait(50 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		si, err := js2.StreamInfo("MS")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 50 {
+			return fmt.Errorf("Expected 50 msgs, got state: %+v", si.State)
+		}
+		return nil
+	})
+
+	// Purge the source streams.
+	for _, sname := range []string{"foo", "bar", "baz"} {
+		if err := js.PurgeStream(sname); err != nil {
+			t.Fatalf("Unexpected purge error: %v", err)
+		}
+	}
+
+	if err := js.DeleteStream("MS"); err != nil {
+		t.Fatalf("Unexpected delete error: %v", err)
+	}
+
+	// Send more msgs now.
+	sendBatch("foo", 10)
+	sendBatch("bar", 15)
+	sendBatch("baz", 25)
+
+	cfg = &nats.StreamConfig{
+		Name: "MS2",
+		Sources: []*nats.StreamSource{
+			{Name: "foo"},
+			{Name: "bar"},
+			{Name: "baz"},
+		},
+		Replicas:  3,
+		Placement: &nats.Placement{Cluster: "C3"},
+	}
+
+	createStream(cfg)
+
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		si, err := js2.StreamInfo("MS2")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if si.State.Msgs != 50 {
+			return fmt.Errorf("Expected 50 msgs, got state: %+v", si.State)
+		}
+		if si.State.FirstSeq != 1 {
+			return fmt.Errorf("Expected start seq of 1, got state: %+v", si.State)
+		}
+		return nil
+	})
+
+	sl := sc.clusterForName("C3").streamLeader("$G", "MS2")
+	doneCh := make(chan bool)
+
+	if sl == sc.leader() {
+		nc.Request(JSApiLeaderStepDown, nil, time.Second)
+		sc.waitOnLeader()
+	}
+
+	// Now test that if the mirror get's interrupted that it picks up where it left off etc.
+	go func() {
+		// Send 50 more messages each.
+		for i := 0; i < 50; i++ {
+			msg := fmt.Sprintf("R-MSG-%d", i+1)
+			for _, sname := range []string{"foo", "bar", "baz"} {
+				if _, err := js.Publish(sname, []byte(msg)); err != nil {
+					t.Errorf("Unexpected publish error: %v", err)
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		doneCh <- true
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	sl.Shutdown()
+
+	sc.clusterForName("C3").waitOnStreamLeader("$G", "MS2")
+	<-doneCh
+
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		si, err := js2.StreamInfo("MS2")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 200 {
+			return fmt.Errorf("Expected 200 msgs, got state: %+v", si.State)
+		}
+		return nil
+	})
+}
+
+func TestNoRaceJetStreamClusterSourcesMuxd(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "SMUX", 3)
+	defer c.shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Send in 10000 messages.
+	msg, toSend := make([]byte, 1024), 10000
+	rand.Read(msg)
+
+	var sources []*nats.StreamSource
+	// Create 10 origin streams.
+	for i := 1; i <= 10; i++ {
+		name := fmt.Sprintf("O-%d", i)
+		if _, err := js.AddStream(&nats.StreamConfig{Name: name}); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		// Load them up with a bunch of messages.
+		for n := 0; n < toSend; n++ {
+			if err := nc.Publish(name, msg); err != nil {
+				t.Fatalf("Unexpected publish error: %v", err)
+			}
+		}
+		sources = append(sources, &nats.StreamSource{Name: name})
+	}
+
+	// Now create our downstream stream that sources from all of them.
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "S", Replicas: 2, Sources: sources}); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	checkFor(t, 20*time.Second, 500*time.Millisecond, func() error {
+		si, err := js.StreamInfo("S")
+		if err != nil {
+			t.Fatalf("Could not retrieve stream info")
+		}
+		if si.State.Msgs != uint64(10*toSend) {
+			return fmt.Errorf("Expected %d msgs, got state: %+v", toSend*10, si.State)
+		}
+		return nil
+	})
+
 }

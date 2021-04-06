@@ -240,6 +240,10 @@ type Server struct {
 
 	// For mapping from a raft node name back to a server name and cluster.
 	nodeToInfo sync.Map
+
+	// For out of resources to not log errors too fast.
+	rerrMu   sync.Mutex
+	rerrLast time.Time
 }
 
 type nodeInfo struct {
@@ -315,7 +319,7 @@ func NewServer(opts *Options) (*Server, error) {
 		info.TLSAvailable = true
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 
 	s := &Server{
 		kp:           kp,
@@ -349,7 +353,7 @@ func NewServer(opts *Options) (*Server, error) {
 
 	// Place ourselves in some lookup maps.
 	ourNode := string(getHash(serverName))
-	s.nodeToInfo.Store(ourNode, &nodeInfo{serverName, opts.Cluster.Name, info.ID, false})
+	s.nodeToInfo.Store(ourNode, nodeInfo{serverName, opts.Cluster.Name, info.ID, false})
 
 	s.routeResolver = opts.Cluster.resolver
 	if s.routeResolver == nil {
@@ -682,7 +686,7 @@ func (s *Server) configureAccounts() error {
 			acc.ic.acc = acc
 			acc.addAllServiceImportSubs()
 		}
-		acc.updated = time.Now()
+		acc.updated = time.Now().UTC()
 		return true
 	})
 
@@ -765,6 +769,7 @@ func (s *Server) checkResolvePreloads() {
 		claims, err := jwt.DecodeAccountClaims(v)
 		if err != nil {
 			s.Errorf("Preloaded account [%s] not valid", k)
+			continue
 		}
 		// Check if it is expired.
 		vr := jwt.CreateValidationResults()
@@ -807,10 +812,10 @@ func (s *Server) globalAccountOnly() bool {
 	return !hasOthers
 }
 
-// Determines if this server is in standalone mode, meaning no routes or gateways or leafnodes.
+// Determines if this server is in standalone mode, meaning no routes or gateways.
 func (s *Server) standAloneMode() bool {
 	opts := s.getOpts()
-	return opts.Cluster.Port == 0 && opts.LeafNode.Port == 0 && opts.Gateway.Port == 0
+	return opts.Cluster.Port == 0 && opts.Gateway.Port == 0
 }
 
 func (s *Server) configuredRoutes() int {
@@ -820,7 +825,7 @@ func (s *Server) configuredRoutes() int {
 // activePeers is used in bootstrapping raft groups like the JetStream meta controller.
 func (s *Server) ActivePeers() (peers []string) {
 	s.nodeToInfo.Range(func(k, v interface{}) bool {
-		si := v.(*nodeInfo)
+		si := v.(nodeInfo)
 		if !si.offline {
 			peers = append(peers, k.(string))
 		}
@@ -1076,7 +1081,7 @@ func (s *Server) SetDefaultSystemAccount() error {
 }
 
 // For internal sends.
-const internalSendQLen = 8192
+const internalSendQLen = 256 * 1024
 
 // Assign a system account. Should only be called once.
 // This sets up a server to send and receive messages from
@@ -1119,6 +1124,7 @@ func (s *Server) setSystemAccount(acc *Account) error {
 		replies: make(map[string]msgHandler),
 		sendq:   make(chan *pubMsg, internalSendQLen),
 		resetCh: make(chan struct{}),
+		sq:      s.newSendQ(),
 		statsz:  eventsHBInterval,
 		orphMax: 5 * eventsHBInterval,
 		chkOrph: 3 * eventsHBInterval,
@@ -1177,7 +1183,7 @@ func (s *Server) createInternalClient(kind int) *client {
 	if kind != SYSTEM && kind != JETSTREAM && kind != ACCOUNT {
 		return nil
 	}
-	now := time.Now()
+	now := time.Now().UTC()
 	c := &client{srv: s, kind: kind, opts: internalOpts, msubs: -1, mpay: -1, start: now, last: now}
 	c.initClient()
 	c.echo = false
@@ -1230,6 +1236,7 @@ func (s *Server) registerAccountNoLock(acc *Account) *Account {
 	// Finish account setup and store.
 	s.setAccountSublist(acc)
 
+	acc.mu.Lock()
 	if acc.clients == nil {
 		acc.clients = make(map[*client]struct{})
 	}
@@ -1239,14 +1246,13 @@ func (s *Server) registerAccountNoLock(acc *Account) *Account {
 	// During config reload, it is possible that account was
 	// already created (global account), so use locking and
 	// make sure we create only if needed.
-	acc.mu.Lock()
 	// TODO(dlc)- Double check that we need this for GWs.
 	if acc.rm == nil && s.opts != nil && s.shouldTrackSubscriptions() {
 		acc.rm = make(map[string]int32)
 		acc.lqws = make(map[string]int32)
 	}
 	acc.srv = s
-	acc.updated = time.Now()
+	acc.updated = time.Now().UTC()
 	acc.mu.Unlock()
 	s.accounts.Store(acc.Name, acc)
 	s.tmpAccounts.Delete(acc.Name)
@@ -1312,9 +1318,12 @@ func (s *Server) updateAccountWithClaimJWT(acc *Account, claimJWT string) error 
 	if acc == nil {
 		return ErrMissingAccount
 	}
-	if acc.claimJWT != "" && acc.claimJWT == claimJWT && !acc.incomplete {
+	acc.mu.RLock()
+	sameClaim := acc.claimJWT != "" && acc.claimJWT == claimJWT && !acc.incomplete
+	acc.mu.RUnlock()
+	if sameClaim {
 		s.Debugf("Requested account update for [%s], same claims detected", acc.Name)
-		return ErrAccountResolverSameClaims
+		return nil
 	}
 	accClaims, _, err := s.verifyAccountClaims(claimJWT)
 	if err == nil && accClaims != nil {
@@ -1326,9 +1335,13 @@ func (s *Server) updateAccountWithClaimJWT(acc *Account, claimJWT string) error 
 			acc.mu.Unlock()
 			return ErrAccountValidation
 		}
-		acc.claimJWT = claimJWT
 		acc.mu.Unlock()
 		s.UpdateAccountClaims(acc, accClaims)
+		acc.mu.Lock()
+		// needs to be set after update completed.
+		// This causes concurrent calls to return with sameClaim=true if the change is effective.
+		acc.claimJWT = claimJWT
+		acc.mu.Unlock()
 		return nil
 	}
 	return err
@@ -1403,10 +1416,7 @@ func (s *Server) fetchAccount(name string) (*Account, error) {
 	// registered and we should use this one.
 	if racc := s.registerAccount(acc); racc != nil {
 		// Update with the new claims in case they are new.
-		// Following call will ignore ErrAccountResolverSameClaims
-		// if claims are the same.
-		err = s.updateAccountWithClaimJWT(racc, claimJWT)
-		if err != nil && err != ErrAccountResolverSameClaims {
+		if err = s.updateAccountWithClaimJWT(racc, claimJWT); err != nil {
 			return nil, err
 		}
 		return racc, nil
@@ -1433,12 +1443,15 @@ func (s *Server) Start() {
 		gc = "not set"
 	}
 
+	// Snapshot server options.
+	opts := s.getOpts()
+
 	s.Noticef("  Version:  %s", VERSION)
 	s.Noticef("  Git:      [%s]", gc)
 	s.Debugf("  Go build: %s", s.info.GoVersion)
 	s.Noticef("  Name:     %s", s.info.Name)
-	if s.sys != nil {
-		s.Noticef("  Node:     %s", s.sys.shash)
+	if opts.JetStream {
+		s.Noticef("  Node:     %s", getHash(s.info.Name))
 	}
 	s.Noticef("  ID:       %s", s.info.ID)
 
@@ -1455,9 +1468,6 @@ func (s *Server) Start() {
 	s.grMu.Lock()
 	s.grRunning = true
 	s.grMu.Unlock()
-
-	// Snapshot server options.
-	opts := s.getOpts()
 
 	if opts.ConfigFile != _EMPTY_ {
 		s.Noticef("Using configuration file: %s", opts.ConfigFile)
@@ -1647,17 +1657,18 @@ func (s *Server) Start() {
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
 // and closing all associated clients.
 func (s *Server) Shutdown() {
-	// Transfer off any raft nodes that we are a leader.
-	s.transferRaftLeaders()
+	// Transfer off any raft nodes that we are a leader by shutting them all down.
+	s.shutdownRaftNodes()
+
+	// This is for clustered JetStream and ephemeral consumers.
+	// No-op if not clustered or not running JetStream.
+	s.migrateEphemerals()
 
 	// Shutdown the eventing system as needed.
 	// This is done first to send out any messages for
 	// account status. We will also clean up any
 	// eventing items associated with accounts.
 	s.shutdownEventing()
-
-	// Now check jetstream.
-	s.shutdownJetStream()
 
 	s.mu.Lock()
 	// Prevent issues with multiple calls.
@@ -1678,7 +1689,12 @@ func (s *Server) Shutdown() {
 	s.grMu.Lock()
 	s.grRunning = false
 	s.grMu.Unlock()
+	s.mu.Unlock()
 
+	// Now check jetstream.
+	s.shutdownJetStream()
+
+	s.mu.Lock()
 	conns := make(map[uint64]*client)
 
 	// Copy off the clients
@@ -1948,13 +1964,13 @@ func (s *Server) StartProfiler() {
 	hp := net.JoinHostPort(opts.Host, strconv.Itoa(port))
 
 	l, err := net.Listen("tcp", hp)
-	s.Noticef("profiling port: %d", l.Addr().(*net.TCPAddr).Port)
 
 	if err != nil {
 		s.mu.Unlock()
 		s.Fatalf("error starting profiler: %s", err)
 		return
 	}
+	s.Noticef("profiling port: %d", l.Addr().(*net.TCPAddr).Port)
 
 	srv := &http.Server{
 		Addr:           hp,
@@ -2200,7 +2216,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 	if maxSubs == 0 {
 		maxSubs = -1
 	}
-	now := time.Now()
+	now := time.Now().UTC()
 
 	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now}
 
@@ -2354,7 +2370,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 // This will save off a closed client in a ring buffer such that
 // /connz can inspect. Useful for debugging, etc.
 func (s *Server) saveClosedClient(c *client, nc net.Conn, reason ClosedState) {
-	now := time.Now()
+	now := time.Now().UTC()
 
 	s.accountDisconnectEvent(c, now, reason.String())
 
@@ -2511,11 +2527,7 @@ func (s *Server) removeClient(c *client) {
 		if updateProtoInfoCount {
 			s.cproto--
 		}
-		mqtt := c.isMqtt()
 		s.mu.Unlock()
-		if mqtt {
-			s.mqttHandleClosedClient(c)
-		}
 	case ROUTER:
 		s.removeRoute(c)
 	case GATEWAY:

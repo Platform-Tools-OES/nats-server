@@ -891,7 +891,8 @@ func (c *client) removeRemoteSubs() {
 		ase := as[accountName]
 		if ase == nil {
 			if v, ok := srv.accounts.Load(accountName); ok {
-				as[accountName] = &asubs{acc: v.(*Account), subs: []*subscription{sub}}
+				ase = &asubs{acc: v.(*Account), subs: []*subscription{sub}}
+				as[accountName] = ase
 			} else {
 				continue
 			}
@@ -901,6 +902,7 @@ func (c *client) removeRemoteSubs() {
 		if srv.gateway.enabled {
 			srv.gatewayUpdateSubInterest(accountName, sub, -1)
 		}
+		srv.updateLeafNodes(ase.acc, sub, -1)
 	}
 
 	// Now remove the subs by batch for each account sublist.
@@ -1077,9 +1079,9 @@ func (c *client) processRemoteSub(argo []byte, hasOrigin bool) (err error) {
 	// We store local subs by account and subject and optionally queue name.
 	// If we have a queue it will have a trailing weight which we do not want.
 	if sub.queue != nil {
-		sub.sid = arg[:len(arg)-len(args[3+off])-1]
+		sub.sid = arg[len(sub.origin)+off : len(arg)-len(args[3+off])-1]
 	} else {
-		sub.sid = arg
+		sub.sid = arg[len(sub.origin)+off:]
 	}
 	key := string(sub.sid)
 
@@ -1416,7 +1418,7 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 	if !exists {
 		s.routes[c.cid] = c
 		s.remotes[id] = c
-		s.nodeToInfo.Store(c.route.hash, &nodeInfo{c.route.remoteName, s.info.Cluster, id, false})
+		s.nodeToInfo.Store(c.route.hash, nodeInfo{c.route.remoteName, s.info.Cluster, id, false})
 		c.mu.Lock()
 		c.route.connectURLs = info.ClientConnectURLs
 		c.route.wsConnURLs = info.WSConnectURLs
@@ -1917,6 +1919,7 @@ func (c *client) processRouteConnect(srv *Server, arg []byte, lang string) error
 		return ErrWrongGateway
 	}
 	var perms *RoutePermissions
+	//TODO this check indicates srv may be nil. see srv usage below
 	if srv != nil {
 		perms = srv.getOpts().Cluster.Permissions
 	}
@@ -1939,7 +1942,7 @@ func (c *client) processRouteConnect(srv *Server, arg []byte, lang string) error
 			}
 		}
 		if shouldReject {
-			errTxt := fmt.Sprintf("Rejecting connection, cluster name %q does not match %q", proto.Cluster, srv.info.Cluster)
+			errTxt := fmt.Sprintf("Rejecting connection, cluster name %q does not match %q", proto.Cluster, clusterName)
 			c.Errorf(errTxt)
 			c.sendErr(errTxt)
 			c.closeConnection(ClusterNameConflict)

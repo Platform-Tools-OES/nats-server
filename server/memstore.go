@@ -98,7 +98,10 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts int
 	}
 
 	if seq != ms.state.LastSeq+1 {
-		return ErrSequenceMismatch
+		if seq > 0 {
+			return ErrSequenceMismatch
+		}
+		seq = ms.state.LastSeq + 1
 	}
 
 	// Adjust first if needed.
@@ -489,11 +492,30 @@ func (ms *memStore) removeMsg(seq uint64, secure bool) bool {
 	}
 
 	if ms.scb != nil {
+		// We do not want to hold any locks here.
+		ms.mu.Unlock()
 		delta := int64(ss)
 		ms.scb(-1, -delta, seq, sm.subj)
+		ms.mu.Lock()
 	}
 
 	return ok
+}
+
+// Type returns the type of the underlying store.
+func (ms *memStore) Type() StorageType {
+	return MemoryStorage
+}
+
+// FastState will fill in state with only the following.
+// Msgs, Bytes, FirstSeq, LastSeq
+func (ms *memStore) FastState(state *StreamState) {
+	ms.mu.RLock()
+	state.Msgs = ms.state.Msgs
+	state.Bytes = ms.state.Bytes
+	state.FirstSeq = ms.state.FirstSeq
+	state.LastSeq = ms.state.LastSeq
+	ms.mu.RUnlock()
 }
 
 func (ms *memStore) State() StreamState {

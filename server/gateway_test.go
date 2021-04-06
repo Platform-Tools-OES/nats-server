@@ -5725,7 +5725,7 @@ type captureGWInterestSwitchLogger struct {
 	imss []string
 }
 
-func (l *captureGWInterestSwitchLogger) Noticef(format string, args ...interface{}) {
+func (l *captureGWInterestSwitchLogger) Debugf(format string, args ...interface{}) {
 	l.Lock()
 	msg := fmt.Sprintf(format, args...)
 	if strings.Contains(msg, fmt.Sprintf("switching account %q to %s mode", globalAccountName, InterestOnly)) ||
@@ -6414,6 +6414,43 @@ func TestGatewayTLSConfigReloadForRemote(t *testing.T) {
 	waitForGatewayFailedConnect(t, srvB, "A", true, time.Second)
 
 	reloadUpdateConfig(t, srvB, confB, fmt.Sprintf(template, optsA.Gateway.Port, `ca_file: "../test/configs/certs/ca.pem"`))
+
+	waitForInboundGateways(t, srvA, 1, time.Second)
+	waitForOutboundGateways(t, srvA, 1, time.Second)
+	waitForInboundGateways(t, srvB, 1, time.Second)
+	waitForOutboundGateways(t, srvB, 1, time.Second)
+}
+
+func TestGatewayAuthDiscovered(t *testing.T) {
+	SetGatewaysSolicitDelay(5 * time.Millisecond)
+	defer ResetGatewaysSolicitDelay()
+
+	confA := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		gateway {
+			name: "A"
+			listen: 127.0.0.1:-1
+			authorization: { user: gwuser, password: changeme }
+		}
+	`))
+	defer os.Remove(confA)
+	srvA, optsA := RunServerWithConfig(confA)
+	defer srvA.Shutdown()
+
+	confB := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		gateway {
+			name: "B"
+			listen: 127.0.0.1:-1
+			authorization: { user: gwuser, password: changeme }
+			gateways: [
+				{ name: A, url: nats://gwuser:changeme@127.0.0.1:%d }
+			]
+		}
+	`, optsA.Gateway.Port)))
+	defer os.Remove(confB)
+	srvB, _ := RunServerWithConfig(confB)
+	defer srvB.Shutdown()
 
 	waitForInboundGateways(t, srvA, 1, time.Second)
 	waitForOutboundGateways(t, srvA, 1, time.Second)

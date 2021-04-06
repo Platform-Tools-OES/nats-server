@@ -91,6 +91,7 @@ type internal struct {
 	sendq    chan *pubMsg
 	resetCh  chan struct{}
 	wg       sync.WaitGroup
+	sq       *sendq
 	orphMax  time.Duration
 	chkOrph  time.Duration
 	statsz   time.Duration
@@ -168,6 +169,7 @@ type ClientInfo struct {
 	Host      string        `json:"host,omitempty"`
 	ID        uint64        `json:"id,omitempty"`
 	Account   string        `json:"acc"`
+	Service   string        `json:"svc,omitempty"`
 	User      string        `json:"user,omitempty"`
 	Name      string        `json:"name,omitempty"`
 	Lang      string        `json:"lang,omitempty"`
@@ -293,7 +295,7 @@ RESET:
 				pm.si.ID = id
 				pm.si.Seq = atomic.AddUint64(seqp, 1)
 				pm.si.Version = VERSION
-				pm.si.Time = time.Now()
+				pm.si.Time = time.Now().UTC()
 				pm.si.JetStream = js
 			}
 			var b []byte
@@ -390,7 +392,9 @@ func (s *Server) sendInternalAccountMsg(a *Account, subject string, msg interfac
 
 	// Replace our client with the account's internal client.
 	if a != nil {
+		a.mu.Lock()
 		c = a.internalClient()
+		a.mu.Unlock()
 	}
 
 	sendq <- &pubMsg{c, subject, _EMPTY_, nil, msg, false}
@@ -416,6 +420,26 @@ func (s *Server) sendInternalMsg(sub, rply string, si *ServerInfo, msg interface
 	s.mu.Unlock()
 	sendq <- &pubMsg{nil, sub, rply, si, msg, false}
 	s.mu.Lock()
+}
+
+// Used to send internal messages from other system clients to avoid no echo issues.
+func (c *client) sendInternalMsg(sub, rply string, si *ServerInfo, msg interface{}) {
+	if c == nil {
+		return
+	}
+	s := c.srv
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.sys == nil || s.sys.sendq == nil {
+		return
+	}
+	sendq := s.sys.sendq
+	// Don't hold lock while placing on the channel.
+	s.mu.Unlock()
+
+	sendq <- &pubMsg{c, sub, rply, si, msg, false}
 }
 
 // Locked version of checking if events system running. Also checks server.
@@ -474,12 +498,12 @@ func (s *Server) checkRemoteServers() {
 }
 
 // Grab RSS and PCPU
-func updateServerUsage(v *ServerStats) {
-	var rss, vss int64
-	var pcpu float64
-	pse.ProcUsage(&pcpu, &rss, &vss)
-	v.Mem = rss
-	v.CPU = pcpu
+// Server lock will be held but released.
+func (s *Server) updateServerUsage(v *ServerStats) {
+	s.mu.Unlock()
+	defer s.mu.Lock()
+	var vss int64
+	pse.ProcUsage(&v.CPU, &v.Mem, &vss)
 	v.Cores = numCores
 }
 
@@ -512,7 +536,7 @@ func routeStat(r *client) *RouteStat {
 // Lock should be held.
 func (s *Server) sendStatsz(subj string) {
 	m := ServerStatsMsg{}
-	updateServerUsage(&m.Stats)
+	s.updateServerUsage(&m.Stats)
 	m.Stats.Start = s.start
 	m.Stats.Connections = len(s.clients)
 	m.Stats.TotalConnections = s.totalClients
@@ -804,6 +828,9 @@ func (s *Server) addSystemAccountExports(sacc *Account) {
 	if err := sacc.AddServiceExport(accSubsSubj, nil); err != nil {
 		s.Errorf("Error adding system service export for %q: %v", accSubsSubj, err)
 	}
+	if s.JetStreamEnabled() {
+		s.checkJetStreamExports()
+	}
 }
 
 // accountClaimUpdate will receive claim updates for accounts.
@@ -843,6 +870,16 @@ func (s *Server) processRemoteServerShutdown(sid string) {
 		v.(*Account).removeRemoteServer(sid)
 		return true
 	})
+	// Update any state in nodeInfo.
+	s.nodeToInfo.Range(func(k, v interface{}) bool {
+		si := v.(nodeInfo)
+		if si.id == sid {
+			si.offline = true
+			s.nodeToInfo.Store(k, si)
+			return false
+		}
+		return true
+	})
 }
 
 // remoteServerShutdownEvent is called when we get an event from another server shutting down.
@@ -875,7 +912,7 @@ func (s *Server) remoteServerShutdown(sub *subscription, _ *client, subject, rep
 	}
 	// Additional processing here.
 	node := string(getHash(si.Name))
-	s.nodeToInfo.Store(node, &nodeInfo{si.Name, si.Cluster, si.ID, true})
+	s.nodeToInfo.Store(node, nodeInfo{si.Name, si.Cluster, si.ID, true})
 }
 
 // remoteServerUpdate listens for statsz updates from other servers.
@@ -893,7 +930,7 @@ func (s *Server) remoteServerUpdate(sub *subscription, _ *client, subject, reply
 		s.sendStatsz(fmt.Sprintf(serverStatsSubj, s.info.ID))
 		s.mu.Unlock()
 	}
-	s.nodeToInfo.Store(node, &nodeInfo{si.Name, si.Cluster, si.ID, false})
+	s.nodeToInfo.Store(node, nodeInfo{si.Name, si.Cluster, si.ID, false})
 }
 
 // updateRemoteServer is called when we have an update from a remote server.
@@ -924,7 +961,7 @@ func (s *Server) processNewServer(ms *ServerInfo) {
 	s.ensureGWsInterestOnlyForLeafNodes()
 	// Add to our nodeToName
 	node := string(getHash(ms.Name))
-	s.nodeToInfo.Store(node, &nodeInfo{ms.Name, ms.Cluster, ms.ID, false})
+	s.nodeToInfo.Store(node, nodeInfo{ms.Name, ms.Cluster, ms.ID, false})
 }
 
 // If GW is enabled on this server and there are any leaf node connections,
@@ -1411,7 +1448,7 @@ func (s *Server) accountDisconnectEvent(c *client, now time.Time, reason string)
 		TypedEvent: TypedEvent{
 			Type: DisconnectEventMsgType,
 			ID:   eid,
-			Time: now.UTC(),
+			Time: now,
 		},
 		Client: ClientInfo{
 			Start:     &c.start,
@@ -1454,13 +1491,13 @@ func (s *Server) sendAuthErrorEvent(c *client) {
 	}
 	eid := s.nextEventID()
 	s.mu.Unlock()
-	now := time.Now()
+	now := time.Now().UTC()
 	c.mu.Lock()
 	m := DisconnectEventMsg{
 		TypedEvent: TypedEvent{
 			Type: DisconnectEventMsgType,
 			ID:   eid,
-			Time: now.UTC(),
+			Time: now,
 		},
 		Client: ClientInfo{
 			Start:     &c.start,
@@ -1516,13 +1553,15 @@ func (s *Server) sysSubscribeInternal(subject string, cb msgHandler) (*subscript
 }
 
 func (s *Server) systemSubscribe(subject, queue string, internalOnly bool, c *client, cb msgHandler) (*subscription, error) {
+	s.mu.Lock()
 	if !s.eventsEnabled() {
+		s.mu.Unlock()
 		return nil, ErrNoSysAccount
 	}
 	if cb == nil {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("undefined message handler")
 	}
-	s.mu.Lock()
 	if c == nil {
 		c = s.sys.client
 	}
@@ -1548,17 +1587,17 @@ func (s *Server) sysUnsubscribe(sub *subscription) {
 	if sub == nil {
 		return
 	}
-
 	s.mu.Lock()
 	if !s.eventsEnabled() {
 		s.mu.Unlock()
 		return
 	}
-	acc := s.sys.account
-	c := s.sys.client
+	c := sub.client
 	s.mu.Unlock()
 
-	c.unsubscribe(acc, sub, true, true)
+	if c != nil {
+		c.processUnsub(sub.sid)
+	}
 }
 
 // This will generate the tracking subject for remote latency from the response subject.

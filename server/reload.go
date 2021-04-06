@@ -1,4 +1,4 @@
-// Copyright 2017-2020 The NATS Authors
+// Copyright 2017-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -553,10 +553,7 @@ type jetStreamOption struct {
 }
 
 func (a *jetStreamOption) Apply(s *Server) {
-	s.Noticef("Reloaded: jetstream")
-	if !a.newValue {
-		s.DisableJetStream()
-	}
+	s.Noticef("Reloaded: JetStream")
 }
 
 func (jso jetStreamOption) IsJetStreamChange() bool {
@@ -698,7 +695,7 @@ func (s *Server) Reload() error {
 		return err
 	}
 	s.mu.Lock()
-	s.configTime = time.Now()
+	s.configTime = time.Now().UTC()
 	s.updateVarzConfigReloadableFields(s.varz)
 	s.mu.Unlock()
 	return nil
@@ -812,6 +809,14 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 		oldConfig = reflect.ValueOf(s.getOpts()).Elem()
 		newConfig = reflect.ValueOf(newOpts).Elem()
 		diffOpts  = []option{}
+
+		// Need to keep track of whether JS is being disabled
+		// to prevent changing limits at runtime.
+		jsEnabled           = s.JetStreamEnabled()
+		disableJS           bool
+		jsMemLimitsChanged  bool
+		jsFileLimitsChanged bool
+		jsStoreDirChanged   bool
 	)
 	for i := 0; i < oldConfig.NumField(); i++ {
 		field := oldConfig.Type().Field(i)
@@ -830,10 +835,17 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 		if err := imposeOrder(newValue); err != nil {
 			return nil, err
 		}
+
 		if changed := !reflect.DeepEqual(oldValue, newValue); !changed {
+			// Check to make sure we are running JetStream if we think we should be.
+			if strings.ToLower(field.Name) == "jetstream" && newValue.(bool) {
+				if !jsEnabled {
+					diffOpts = append(diffOpts, &jetStreamOption{newValue: true})
+				}
+			}
 			continue
 		}
-		switch strings.ToLower(field.Name) {
+		switch optName := strings.ToLower(field.Name); optName {
 		case "traceverbose":
 			diffOpts = append(diffOpts, &traceVerboseOption{newValue: newValue.(bool)})
 		case "trace":
@@ -996,26 +1008,56 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			if new != old {
 				diffOpts = append(diffOpts, &jetStreamOption{newValue: new})
 			}
+
+			// Mark whether JS will be disabled.
+			disableJS = !new
 		case "storedir":
 			new := newValue.(string)
 			old := oldValue.(string)
-			// If they are the same, or, we have turned it off (-1) that is ok.
-			if new != _EMPTY_ && new != old {
-				return nil, fmt.Errorf("config reload not supported for jetstream storage directory")
+			modified := new != old
+
+			// Check whether JS is being disabled and/or storage dir attempted to change.
+			if jsEnabled && modified {
+				if new == _EMPTY_ {
+					// This means that either JS is being disabled or it is using an temp dir.
+					// Allow the change but error in case JS was not disabled.
+					jsStoreDirChanged = true
+				} else {
+					return nil, fmt.Errorf("config reload not supported for jetstream storage directory")
+				}
 			}
-		case "jetstreammaxmemory":
+		case "jetstreammaxmemory", "jetstreammaxstore":
 			old := oldValue.(int64)
 			new := newValue.(int64)
-			// If they are the same, or, we have turned it off (-1) that is ok.
-			if new != -1 && new != old {
-				return nil, fmt.Errorf("config reload not supported for jetstream max memory")
-			}
-		case "jetstreammaxstore":
-			old := oldValue.(int64)
-			new := newValue.(int64)
-			// If they are the same, or, we have turned it off (-1) that is ok.
-			if new != -1 && new != old {
-				return nil, fmt.Errorf("config reload not supported for jetstream max storage")
+
+			// Check whether JS is being disabled and/or limits are being changed.
+			var (
+				modified  = new != old
+				fromUnset = old == -1
+				fromSet   = !fromUnset
+				toUnset   = new == -1
+				toSet     = !toUnset
+			)
+			if jsEnabled && modified {
+				// Cannot change limits from dynamic storage at runtime.
+				switch {
+				case fromSet && toUnset:
+					// Limits changed but it may mean that JS is being disabled,
+					// keep track of the change and error in case it is not.
+					switch optName {
+					case "jetstreammaxmemory":
+						jsMemLimitsChanged = true
+					case "jetstreammaxstore":
+						jsFileLimitsChanged = true
+					default:
+						return nil, fmt.Errorf("config reload not supported for jetstream max memory and store")
+					}
+				case fromUnset && toSet:
+					// Prevent changing from dynamic max memory / file at runtime.
+					return nil, fmt.Errorf("config reload not supported for jetstream dynamic max memory and store")
+				default:
+					return nil, fmt.Errorf("config reload not supported for jetstream max memory and store")
+				}
 			}
 		case "websocket":
 			// Similar to gateways
@@ -1043,6 +1085,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
 					field.Name, oldValue, newValue)
 			}
+			tmpNew.AckWait = newValue.(MQTTOpts).AckWait
+			tmpNew.MaxAckPending = newValue.(MQTTOpts).MaxAckPending
 		case "connecterrorreports":
 			diffOpts = append(diffOpts, &connectErrorReports{newValue: newValue.(int)})
 		case "reconnecterrorreports":
@@ -1092,6 +1136,16 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 		}
 	}
 
+	// If not disabling JS but limits have changed then it is an error.
+	if !disableJS {
+		if jsMemLimitsChanged || jsFileLimitsChanged {
+			return nil, fmt.Errorf("config reload not supported for jetstream max memory and max store")
+		}
+		if jsStoreDirChanged {
+			return nil, fmt.Errorf("config reload not supported for jetstream storage dir")
+		}
+	}
+
 	return diffOpts, nil
 }
 
@@ -1132,6 +1186,8 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		reloadAuth         = false
 		reloadClusterPerms = false
 		reloadClientTrcLvl = false
+		reloadJetstream    = false
+		jsEnabled          = false
 	)
 	for _, opt := range opts {
 		opt.Apply(s)
@@ -1147,6 +1203,10 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		if opt.IsClusterPermsChange() {
 			reloadClusterPerms = true
 		}
+		if opt.IsJetStreamChange() {
+			reloadJetstream = true
+			jsEnabled = opt.(*jetStreamOption).newValue
+		}
 	}
 
 	if reloadLogging {
@@ -1161,6 +1221,17 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 	if reloadClusterPerms {
 		s.reloadClusterPermissions(ctx.oldClusterPerms)
 	}
+
+	if reloadJetstream {
+		if !jsEnabled {
+			s.DisableJetStream()
+		} else if !s.JetStreamEnabled() {
+			if err := s.restartJetStream(); err != nil {
+				s.Warnf("Can't start JetStream: %v", err)
+			}
+		}
+	}
+
 	// For remote gateways and leafnodes, make sure that their TLS configuration
 	// is updated (since the config is "captured" early and changes would otherwise
 	// not be visible).
@@ -1300,8 +1371,6 @@ func (s *Server) reloadAuthorization() {
 			s.accounts.Store(s.sys.account.Name, s.sys.account)
 		}
 		// Double check any JetStream configs.
-		// For now, seems like JS as a whole cannot be enabled/disabled with
-		// config reload, so check only if was started with JS enabled.
 		checkJetStream = s.js != nil
 	} else if s.opts.AccountResolver != nil {
 		s.configureResolver()
@@ -1322,8 +1391,7 @@ func (s *Server) reloadAuthorization() {
 				s.mu.Unlock()
 				accClaims, claimJWT, _ := s.fetchAccountClaims(accName)
 				if accClaims != nil {
-					err := s.updateAccountWithClaimJWT(acc, claimJWT)
-					if err != nil && err != ErrAccountResolverSameClaims {
+					if err := s.updateAccountWithClaimJWT(acc, claimJWT); err != nil {
 						s.Noticef("Reloaded: deleting account [bad claims]: %q", accName)
 						s.accounts.Delete(k)
 					}
@@ -1363,13 +1431,14 @@ func (s *Server) reloadAuthorization() {
 		// can't hold the lock as go routine reading it may be waiting for lock as well
 		resetCh = s.sys.resetCh
 	}
-	// Check that publish retained messages sources are still allowed to publish.
-	s.mqttCheckPubRetainedPerms()
 	s.mu.Unlock()
 
 	if resetCh != nil {
 		resetCh <- struct{}{}
 	}
+
+	// Check that publish retained messages sources are still allowed to publish.
+	s.mqttCheckPubRetainedPerms()
 
 	// Close clients that have moved accounts
 	for _, client := range cclients {
@@ -1399,22 +1468,16 @@ func (s *Server) reloadAuthorization() {
 		}
 	}
 
-	// We will double check all JetStream configs on a reload.
-	if checkJetStream {
-		var err error
-		s.getJetStream().clearResources()
-		if s.globalAccountOnly() {
-			err = s.GlobalAccount().EnableJetStream(nil)
-		} else {
-			err = s.configAllJetStreamAccounts()
-		}
-		if err != nil {
-			s.Errorf(err.Error())
-		}
-	}
-
 	if res := s.AccountResolver(); res != nil {
 		res.Reload()
+	}
+
+	// We will double check all JetStream configs on a reload.
+	if checkJetStream {
+		s.getJetStream().clearResources()
+		if err := s.enableJetStreamAccounts(); err != nil {
+			s.Errorf(err.Error())
+		}
 	}
 }
 

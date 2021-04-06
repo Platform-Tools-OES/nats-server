@@ -610,7 +610,7 @@ func TestJWTAccountRenewFromResolver(t *testing.T) {
 	addAccountToMemResolver(s, apub, ajwt)
 	// Make sure the too quick update suppression does not bite us.
 	acc.mu.Lock()
-	acc.updated = time.Now().Add(-1 * time.Hour)
+	acc.updated = time.Now().UTC().Add(-1 * time.Hour)
 	acc.mu.Unlock()
 
 	// Do not update the account directly. The resolver should
@@ -2964,7 +2964,7 @@ func TestJWTAccountLimitsMaxConnsAfterExpired(t *testing.T) {
 	acc, _ := s.LookupAccount(fooPub)
 	acc.mu.Lock()
 	acc.expired = true
-	acc.updated = time.Now().Add(-2 * time.Second) // work around updating to quickly
+	acc.updated = time.Now().UTC().Add(-2 * time.Second) // work around updating to quickly
 	acc.mu.Unlock()
 
 	// Now update with new expiration and max connections lowered to 2
@@ -3369,7 +3369,7 @@ func TestAccountNATSResolverFetch(t *testing.T) {
 	}
 	connect := func(url string, credsfile string, acc string, srvs ...*Server) {
 		t.Helper()
-		nc := natsConnect(t, url, nats.UserCredentials(credsfile))
+		nc := natsConnect(t, url, nats.UserCredentials(credsfile), nats.Timeout(5*time.Second))
 		nc.Close()
 		require_NoLocalOrRemoteConnections(acc, srvs...)
 	}
@@ -4405,14 +4405,16 @@ func TestJWTUserRevocation(t *testing.T) {
 	defer ncSys.Close()
 	ncChan := make(chan *nats.Msg, 10)
 	defer close(ncChan)
-	ncSys.ChanSubscribe(fmt.Sprintf(disconnectEventSubj, apub), ncChan) // observe disconnect message
+	sub, _ := ncSys.ChanSubscribe(fmt.Sprintf(disconnectEventSubj, apub), ncChan) // observe disconnect message
+	defer sub.Unsubscribe()
 	// use credentials that will be revoked ans assure that the connection will be disconnected
 	nc := natsConnect(t, srv.ClientURL(), nats.UserCredentials(aCreds1),
-		nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
-			if lErr := conn.LastError(); lErr != nil && strings.Contains(lErr.Error(), "Authentication Revoked") {
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			if err != nil && strings.Contains(err.Error(), "authentication revoked") {
 				doneChan <- struct{}{}
 			}
-		}))
+		}),
+	)
 	defer nc.Close()
 	// update account jwt to contain revocation
 	if updateJwt(t, srv.ClientURL(), sysCreds, ajwt2, 1) != 1 {
@@ -4437,7 +4439,7 @@ func TestJWTUserRevocation(t *testing.T) {
 	defer nc2.Close()
 }
 
-func TestJWTAccountOps(t *testing.T) {
+func TestJWTAccountFetchTimeout(t *testing.T) {
 	createAccountAndUser := func(pubKey, jwt1, creds1 *string) {
 		t.Helper()
 		kp, _ := nkeys.CreateAccount()
@@ -4445,6 +4447,74 @@ func TestJWTAccountOps(t *testing.T) {
 		claim := jwt.NewAccountClaims(*pubKey)
 		var err error
 		*jwt1, err = claim.Encode(oKp)
+		require_NoError(t, err)
+		ukp, _ := nkeys.CreateUser()
+		seed, _ := ukp.Seed()
+		upub, _ := ukp.PublicKey()
+		uclaim := newJWTTestUserClaims()
+		uclaim.Subject = upub
+		ujwt1, err := uclaim.Encode(kp)
+		require_NoError(t, err)
+		*creds1 = genCredsFile(t, ujwt1, seed)
+	}
+	for _, cfg := range []string{
+		`type: full`,
+		`type: cache`,
+	} {
+		t.Run("", func(t *testing.T) {
+			var syspub, sysjwt, sysCreds string
+			createAccountAndUser(&syspub, &sysjwt, &sysCreds)
+			defer os.Remove(sysCreds)
+			var apub, ajwt1, aCreds1 string
+			createAccountAndUser(&apub, &ajwt1, &aCreds1)
+			defer os.Remove(aCreds1)
+			dirSrv := createDir(t, "srv")
+			defer os.RemoveAll(dirSrv)
+			conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: -1
+		operator: %s
+		system_account: %s
+		resolver: {
+			%s
+			timeout: "100ms"
+			dir: %s
+		}
+    `, ojwt, syspub, cfg, dirSrv)))
+			defer os.Remove(conf)
+			srv, _ := RunServerWithConfig(conf)
+			defer srv.Shutdown()
+			updateJwt(t, srv.ClientURL(), sysCreds, sysjwt, 1) // update system account jwt
+			start := time.Now()
+			nc, err := nats.Connect(srv.ClientURL(), nats.UserCredentials(aCreds1))
+			if err == nil {
+				t.Fatal("expected an error, got none")
+			} else if !strings.Contains(err.Error(), "Authorization Violation") {
+				t.Fatalf("expected an authorization violation, got: %v", err)
+			}
+			if time.Since(start) > 300*time.Millisecond {
+				t.Fatal("expected timeout earlier")
+			}
+			defer nc.Close()
+		})
+	}
+}
+
+func TestJWTAccountOps(t *testing.T) {
+	op, _ := nkeys.CreateOperator()
+	opPk, _ := op.PublicKey()
+	sk, _ := nkeys.CreateOperator()
+	skPk, _ := sk.PublicKey()
+	opClaim := jwt.NewOperatorClaims(opPk)
+	opClaim.SigningKeys.Add(skPk)
+	opJwt, err := opClaim.Encode(op)
+	require_NoError(t, err)
+	createAccountAndUser := func(pubKey, jwt1, creds1 *string) {
+		t.Helper()
+		kp, _ := nkeys.CreateAccount()
+		*pubKey, _ = kp.PublicKey()
+		claim := jwt.NewAccountClaims(*pubKey)
+		var err error
+		*jwt1, err = claim.Encode(sk)
 		require_NoError(t, err)
 
 		ukp, _ := nkeys.CreateUser()
@@ -4457,12 +4527,12 @@ func TestJWTAccountOps(t *testing.T) {
 		require_NoError(t, err)
 		*creds1 = genCredsFile(t, ujwt1, seed)
 	}
-	generateRequest := func(accs []string) []byte {
+	generateRequest := func(accs []string, kp nkeys.KeyPair) []byte {
 		t.Helper()
-		opk, _ := oKp.PublicKey()
+		opk, _ := kp.PublicKey()
 		c := jwt.NewGenericClaims(opk)
 		c.Data["accounts"] = accs
-		cJwt, err := c.Encode(oKp)
+		cJwt, err := c.Encode(kp)
 		if err != nil {
 			t.Fatalf("Expected no error %v", err)
 		}
@@ -4490,7 +4560,9 @@ func TestJWTAccountOps(t *testing.T) {
 			%s
 			dir: %s
 		}
-    `, ojwt, syspub, cfg, dirSrv)))
+    `, opJwt, syspub, cfg, dirSrv)))
+			disconnectErrChan := make(chan struct{}, 1)
+			defer close(disconnectErrChan)
 			defer os.Remove(conf)
 			srv, _ := RunServerWithConfig(conf)
 			defer srv.Shutdown()
@@ -4503,26 +4575,40 @@ func TestJWTAccountOps(t *testing.T) {
 			nc.Subscribe(fmt.Sprintf(accLookupReqSubj, apub), func(msg *nats.Msg) {
 				msg.Respond([]byte(ajwt1))
 			})
-			// connect so there is a reason to cache the request
-			ncA := natsConnect(t, srv.ClientURL(), nats.UserCredentials(aCreds1))
-			ncA.Close()
+			// connect so there is a reason to cache the request and so disconnect can be observed
+			ncA := natsConnect(t, srv.ClientURL(), nats.UserCredentials(aCreds1), nats.NoReconnect(),
+				nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+					if err != nil && strings.Contains(err.Error(), "account authentication expired") {
+						disconnectErrChan <- struct{}{}
+					}
+				}))
+			defer ncA.Close()
 			resp, err := nc.Request(accListReqSubj, nil, time.Second)
 			require_NoError(t, err)
 			require_True(t, strings.Contains(string(resp.Data), apub))
 			require_True(t, strings.Contains(string(resp.Data), syspub))
 			// delete nothing
-			resp, err = nc.Request(accDeleteReqSubj, generateRequest([]string{}), time.Second)
+			resp, err = nc.Request(accDeleteReqSubj, generateRequest([]string{}, op), time.Second)
 			require_NoError(t, err)
 			require_True(t, strings.Contains(string(resp.Data), `"message":"deleted 0 accounts"`))
 			// issue delete, twice to also delete a non existing account
+			// also switch which key used to sign the request
 			for i := 0; i < 2; i++ {
-				resp, err = nc.Request(accDeleteReqSubj, generateRequest([]string{apub}), time.Second)
+				resp, err = nc.Request(accDeleteReqSubj, generateRequest([]string{apub}, sk), time.Second)
 				require_NoError(t, err)
 				require_True(t, strings.Contains(string(resp.Data), `"message":"deleted 1 accounts"`))
 				resp, err = nc.Request(accListReqSubj, nil, time.Second)
 				require_False(t, strings.Contains(string(resp.Data), apub))
 				require_True(t, strings.Contains(string(resp.Data), syspub))
 				require_NoError(t, err)
+				if i > 0 {
+					continue
+				}
+				select {
+				case <-disconnectErrChan:
+				case <-time.After(time.Second):
+					t.Fatal("Callback not executed")
+				}
 			}
 		})
 	}
@@ -4826,6 +4912,140 @@ func TestJWTAccountImportsWithWildcardSupport(t *testing.T) {
 					"my.request.1.2.bar", "my.events.2.1.bar")
 			})
 		}
+	})
+}
+
+func TestJWTAccountTokenImportMisuse(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+	defer os.Remove(sysCreds)
+
+	aExpKp, aExpPub := createKey(t)
+	aExpClaim := jwt.NewAccountClaims(aExpPub)
+	aExpClaim.Name = "Export"
+	aExpClaim.Exports.Add(&jwt.Export{
+		Subject:  "$events.*.$in.*.>",
+		Type:     jwt.Stream,
+		TokenReq: true,
+	}, &jwt.Export{
+		Subject:  "foo",
+		Type:     jwt.Stream,
+		TokenReq: true,
+	})
+	aExpJwt := encodeClaim(t, aExpClaim, aExpPub)
+	aExpCreds := newUser(t, aExpKp)
+	defer os.Remove(aExpCreds)
+
+	createImportingAccountClaim := func(aImpKp nkeys.KeyPair, aExpPub string, ac *jwt.ActivationClaims) (string, string) {
+		t.Helper()
+		token, err := ac.Encode(aExpKp)
+		require_NoError(t, err)
+
+		aImpPub, err := aImpKp.PublicKey()
+		require_NoError(t, err)
+		aImpClaim := jwt.NewAccountClaims(aImpPub)
+		aImpClaim.Name = "Import"
+		aImpClaim.Imports.Add(&jwt.Import{
+			Subject: "$events.*.$in.*.>",
+			Type:    jwt.Stream,
+			Account: aExpPub,
+			Token:   token,
+		})
+		aImpJwt := encodeClaim(t, aImpClaim, aImpPub)
+		aImpCreds := newUser(t, aImpKp)
+		return aImpJwt, aImpCreds
+	}
+
+	testConnect := func(aExpPub, aExpJwt, aExpCreds, aImpPub, aImpJwt, aImpCreds string) {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/A/" {
+				// Server startup
+				w.Write(nil)
+			} else if r.URL.Path == "/A/"+aExpPub {
+				w.Write([]byte(aExpJwt))
+			} else if r.URL.Path == "/A/"+aImpPub {
+				w.Write([]byte(aImpJwt))
+			} else {
+				t.Fatal("not expected")
+			}
+		}))
+		defer ts.Close()
+		cf := createConfFile(t, []byte(fmt.Sprintf(`
+			listen: -1
+			operator: %s
+			resolver: URL("%s/A/")
+		`, ojwt, ts.URL)))
+		defer os.Remove(cf)
+
+		s, opts := RunServerWithConfig(cf)
+		defer s.Shutdown()
+
+		ncImp, err := nats.Connect(fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port), nats.UserCredentials(aImpCreds))
+		require_Error(t, err) // misuse needs to result in an error
+		defer ncImp.Close()
+	}
+
+	testNatsResolver := func(aImpJwt string) {
+		t.Helper()
+		dirSrv := createDir(t, "srv")
+		defer os.RemoveAll(dirSrv)
+		cf := createConfFile(t, []byte(fmt.Sprintf(`
+			listen: -1
+			operator: %s
+			system_account: %s
+			resolver: {
+				type: full
+				dir: %s
+			}
+		`, ojwt, syspub, dirSrv)))
+
+		s, _ := RunServerWithConfig(cf)
+		defer s.Shutdown()
+
+		require_True(t, updateJwt(t, s.ClientURL(), sysCreds, sysJwt, 1) == 1)
+		require_True(t, updateJwt(t, s.ClientURL(), sysCreds, aExpJwt, 1) == 1)
+		require_True(t, updateJwt(t, s.ClientURL(), sysCreds, aImpJwt, 1) == 0) // assure this did not succeed
+	}
+
+	t.Run("wrong-account", func(t *testing.T) {
+		aImpKp, aImpPub := createKey(t)
+		ac := &jwt.ActivationClaims{}
+		_, ac.Subject = createKey(t) // on purpose issue this token for another account
+		ac.ImportSubject = "$events.*.$in.*.>"
+		ac.ImportType = jwt.Stream
+
+		aImpJwt, aImpCreds := createImportingAccountClaim(aImpKp, aExpPub, ac)
+		defer os.Remove(aImpCreds)
+		testConnect(aExpPub, aExpJwt, aExpCreds, aImpPub, aImpJwt, aImpCreds)
+		testNatsResolver(aImpJwt)
+	})
+
+	t.Run("different-subject", func(t *testing.T) {
+		aImpKp, aImpPub := createKey(t)
+		ac := &jwt.ActivationClaims{}
+		ac.Subject = aImpPub
+		ac.ImportSubject = "foo" // on purpose use a subject from another export
+		ac.ImportType = jwt.Stream
+
+		aImpJwt, aImpCreds := createImportingAccountClaim(aImpKp, aExpPub, ac)
+		defer os.Remove(aImpCreds)
+		testConnect(aExpPub, aExpJwt, aExpCreds, aImpPub, aImpJwt, aImpCreds)
+		testNatsResolver(aImpJwt)
+	})
+
+	t.Run("non-existing-subject", func(t *testing.T) {
+		aImpKp, aImpPub := createKey(t)
+		ac := &jwt.ActivationClaims{}
+		ac.Subject = aImpPub
+		ac.ImportSubject = "does-not-exist-or-from-different-export" // on purpose use a non exported subject
+		ac.ImportType = jwt.Stream
+
+		aImpJwt, aImpCreds := createImportingAccountClaim(aImpKp, aExpPub, ac)
+		defer os.Remove(aImpCreds)
+		testConnect(aExpPub, aExpJwt, aExpCreds, aImpPub, aImpJwt, aImpCreds)
+		testNatsResolver(aImpJwt)
 	})
 }
 

@@ -810,6 +810,80 @@ func TestFileStoreCompact(t *testing.T) {
 	}
 }
 
+func TestFileStoreCompactLastPlusOne(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 8192, AsyncFlush: false}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	subj, msg := "foo", make([]byte, 10_000)
+	for i := 0; i < 10_000; i++ {
+		if _, _, err := fs.StoreMsg(subj, nil, msg); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+	if state := fs.State(); state.Msgs != 10_000 {
+		t.Fatalf("Expected 1000000 msgs, got %d", state.Msgs)
+	}
+	if _, err := fs.Compact(10_001); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	state := fs.State()
+	if state.Msgs != 0 {
+		t.Fatalf("Expected no message but got %d", state.Msgs)
+	}
+
+	fs.StoreMsg(subj, nil, msg)
+	state = fs.State()
+	if state.Msgs != 1 {
+		t.Fatalf("Expected one message but got %d", state.Msgs)
+	}
+}
+
+func TestFileStoreCompactPerf(t *testing.T) {
+	t.SkipNow()
+
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 8192, AsyncFlush: true}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	subj, msg := "foo", []byte("Hello World")
+	for i := 0; i < 100_000; i++ {
+		fs.StoreMsg(subj, nil, msg)
+	}
+	if state := fs.State(); state.Msgs != 100_000 {
+		t.Fatalf("Expected 1000000 msgs, got %d", state.Msgs)
+	}
+	start := time.Now()
+	n, err := fs.Compact(90_001)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	t.Logf("Took %v to compact\n", time.Since(start))
+
+	if n != 90_000 {
+		t.Fatalf("Expected to have purged 90_000 msgs, got %d", n)
+	}
+	state := fs.State()
+	if state.Msgs != 10_000 {
+		t.Fatalf("Expected 10_000 msgs, got %d", state.Msgs)
+	}
+	if state.FirstSeq != 90_001 {
+		t.Fatalf("Expected first seq of 90_001, got %d", state.FirstSeq)
+	}
+}
+
 func TestFileStoreStreamTruncate(t *testing.T) {
 	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
 	os.MkdirAll(storeDir, 0755)
@@ -1263,7 +1337,7 @@ func TestFileStoreMeta(t *testing.T) {
 		t.Fatalf("Checksums do not match, got %q vs %q", mychecksum, checksum)
 	}
 
-	// Now create an observable. Same deal for them.
+	// Now create a consumer. Same deal for them.
 	oconfig := ConsumerConfig{
 		DeliverSubject: "d",
 		FilterSubject:  "foo",
@@ -1876,15 +1950,15 @@ func TestFileStoreWriteFailures(t *testing.T) {
 	// This test should be run inside an environment where this directory
 	// has a limited size.
 	// E.g. Docker
-	// docker run -ti --tmpfs /jswf_test:rw,size=32k --rm -v ~/Development/go/src:/go/src -w /go/src/github.com/nats-io/nats-server/ golang:1.15 /bin/bash
+	// docker run -ti --tmpfs /jswf_test:rw,size=32k --rm -v ~/Development/go/src:/go/src -w /go/src/github.com/nats-io/nats-server/ golang:1.16 /bin/bash
 	tdir := path.Join("/", "jswf_test")
 	if stat, err := os.Stat(tdir); err != nil || !stat.IsDir() {
 		t.SkipNow()
 	}
+	defer os.RemoveAll(tdir)
 
 	storeDir := path.Join(tdir, JetStreamStoreDir)
 	os.MkdirAll(storeDir, 0755)
-	defer os.RemoveAll(storeDir)
 
 	subj, msg := "foo", []byte("Hello Write Failures!")
 	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
@@ -1906,6 +1980,7 @@ func TestFileStoreWriteFailures(t *testing.T) {
 	}
 
 	state := fs.State()
+
 	if state.LastSeq != lseq-1 {
 		t.Fatalf("Expected last seq to be %d, got %d\n", lseq-1, state.LastSeq)
 	}
@@ -1916,7 +1991,7 @@ func TestFileStoreWriteFailures(t *testing.T) {
 		t.Fatalf("Expected error loading seq that failed, got none")
 	}
 	// Loading should still work.
-	if _, _, _, _, err := fs.LoadMsg(2); err != nil {
+	if _, _, _, _, err := fs.LoadMsg(1); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
@@ -1930,6 +2005,7 @@ func TestFileStoreWriteFailures(t *testing.T) {
 	defer fs.Stop()
 
 	state2 := fs.State()
+
 	// Ignore lost state.
 	state.Lost, state2.Lost = nil, nil
 	if !reflect.DeepEqual(state2, state) {

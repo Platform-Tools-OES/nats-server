@@ -1257,8 +1257,8 @@ func TestAccountReqMonitoring(t *testing.T) {
 	// query SUBSZ for account
 	if resp, err := ncSys.Request(subsz, nil, time.Second); err != nil {
 		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":25,`) {
-		t.Fatalf("unexpected subs count (expected 0): %v", string(resp.Data))
+	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":1,`) {
+		t.Fatalf("unexpected subs count (expected 1): %v", string(resp.Data))
 	}
 	// create a subscription
 	if sub, err := nc.Subscribe("foo", func(msg *nats.Msg) {}); err != nil {
@@ -1270,8 +1270,8 @@ func TestAccountReqMonitoring(t *testing.T) {
 	// query SUBSZ for account
 	if resp, err := ncSys.Request(subsz, nil, time.Second); err != nil {
 		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":26,`) {
-		t.Fatalf("unexpected subs count (expected 26): %v", string(resp.Data))
+	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":2,`) {
+		t.Fatalf("unexpected subs count (expected 2): %v", string(resp.Data))
 	} else if !strings.Contains(string(resp.Data), `"subject":"foo"`) {
 		t.Fatalf("expected subscription foo: %v", string(resp.Data))
 	}
@@ -1585,8 +1585,9 @@ func TestSystemAccountWithGateways(t *testing.T) {
 
 	// Create a client on A that will subscribe on $SYS.ACCOUNT.>
 	urla := fmt.Sprintf("nats://%s:%d", oa.Host, oa.Port)
-	nca := natsConnect(t, urla, createUserCreds(t, sa, akp))
+	nca := natsConnect(t, urla, createUserCreds(t, sa, akp), nats.Name("SYS"))
 	defer nca.Close()
+	nca.Flush()
 
 	sub, _ := nca.SubscribeSync("$SYS.ACCOUNT.>")
 	defer sub.Unsubscribe()
@@ -1601,41 +1602,57 @@ func TestSystemAccountWithGateways(t *testing.T) {
 	ncb := natsConnect(t, urlb, createUserCreds(t, sb, akp), nats.Name("TEST EVENTS"))
 	defer ncb.Close()
 
-	msg, err := sub.NextMsg(time.Second)
-	if err != nil {
-		t.Fatalf("Error receiving msg: %v", err)
+	// space for .CONNECT and .CONNS from SYS and $G as well as one extra message
+	msgs := [4]*nats.Msg{}
+	var err error
+	msgs[0], err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	msgs[1], err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	msgs[2], err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	// TODO: There is a race currently that can cause the server to process the
+	// system event *after* the subscription on "A" has been registered, and so
+	// the "nca" client would receive its own CONNECT message.
+	msgs[3], _ = sub.NextMsg(250 * time.Millisecond)
+
+	findMsgs := func(sub string) []*nats.Msg {
+		rMsgs := []*nats.Msg{}
+		for _, m := range msgs {
+			if m == nil {
+				continue
+			}
+			if m.Subject == sub {
+				rMsgs = append(rMsgs, m)
+			}
+		}
+		return rMsgs
 	}
-	connsMsgA, err := sub.NextMsg(time.Second)
-	if err != nil {
-		t.Fatalf("Error receiving msg: %v", err)
+
+	msg := findMsgs(fmt.Sprintf("$SYS.ACCOUNT.%s.CONNECT", sa.SystemAccount().Name))
+	var bMsg *nats.Msg
+	if len(msg) != 1 {
+		t.Fatal("Expected one message")
+	} else {
+		bMsg = msg[0]
 	}
-	connsMsgG, err := sub.NextMsg(time.Second)
-	if err != nil {
-		t.Fatalf("Error receiving msg: %v", err)
+
+	require_Contains(t, string(bMsg.Data), sb.ID())
+	require_Contains(t, string(bMsg.Data), `"cluster":"B"`)
+	require_Contains(t, string(bMsg.Data), `"name":"TEST EVENTS"`)
+
+	connsMsgA := findMsgs(fmt.Sprintf("$SYS.ACCOUNT.%s.SERVER.CONNS", sa.SystemAccount().Name))
+	if len(connsMsgA) != 1 {
+		t.Fatal("Expected a message")
 	}
-	if strings.HasSuffix(connsMsgA.Subject, ".CONNECT") {
-		msg, connsMsgA = connsMsgA, msg
-	} else if strings.HasSuffix(connsMsgG.Subject, ".CONNECT") {
-		msg, connsMsgG = connsMsgG, msg
-	}
-	if connsMsgG.Subject != "$SYS.ACCOUNT.$G.SERVER.CONNS" {
-		connsMsgA, connsMsgG = connsMsgG, connsMsgA
-	}
-	if connsMsgG.Subject != "$SYS.ACCOUNT.$G.SERVER.CONNS" {
-		t.Fatalf("Expected subject $SYS.ACCOUNT.$G.SERVER.CONNS but got %s", connsMsgG.Subject)
-	}
-	// Basic checks, could expand on that...
-	accName := sa.SystemAccount().Name
-	if connsMsgA.Subject != fmt.Sprintf("$SYS.ACCOUNT.%s.SERVER.CONNS", accName) {
-		t.Fatalf("Expected subject to be $SYS.ACCOUNT.%s.SERVER.CONNS but got: %s", accName, connsMsgA.Subject)
-	}
-	if msg.Subject != fmt.Sprintf("$SYS.ACCOUNT.%s.CONNECT", accName) {
-		t.Fatalf("Expected subject to be $SYS.ACCOUNT.%s.CONNECT but got: %s", accName, msg.Subject)
+	connsMsgG := findMsgs("$SYS.ACCOUNT.$G.SERVER.CONNS")
+	if len(connsMsgG) != 1 {
+		t.Fatal("Expected a message")
 	}
 }
 func TestServerEventsStatsZ(t *testing.T) {
 	serverStatsReqSubj := "$SYS.REQ.SERVER.%s.STATSZ"
-	preStart := time.Now()
+	preStart := time.Now().UTC()
 	// Add little bit of delay to make sure that time check
 	// between pre-start and actual start does not fail.
 	time.Sleep(5 * time.Millisecond)
@@ -1644,7 +1661,7 @@ func TestServerEventsStatsZ(t *testing.T) {
 	defer sb.Shutdown()
 	// Same between actual start and post start.
 	time.Sleep(5 * time.Millisecond)
-	postStart := time.Now()
+	postStart := time.Now().UTC()
 
 	url := fmt.Sprintf("nats://%s:%d", optsA.Host, optsA.Port)
 	ncs, err := nats.Connect(url, createUserCreds(t, sa, akp))

@@ -662,7 +662,7 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 	if maxSubs == 0 {
 		maxSubs = -1
 	}
-	now := time.Now()
+	now := time.Now().UTC()
 
 	c := &client{srv: s, nc: conn, kind: LEAF, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now}
 	// Do not update the smap here, we need to do it in initLeafNodeSmapAndSendSubs
@@ -1256,10 +1256,13 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 
 	// Now walk the results and add them to our smap
 	c.mu.Lock()
+	rc := c.leaf.remoteCluster
 	c.leaf.smap = make(map[string]int32)
 	for _, sub := range subs {
 		// We ignore ourselves here.
-		if c != sub.client {
+		// Also don't add the subscription if it has a origin cluster and the
+		// cluster name matches the one of the client we are sending to.
+		if c != sub.client && (sub.origin == nil || (string(sub.origin) != rc)) {
 			c.leaf.smap[keyFromSub(sub)]++
 			if c.leaf.tsub == nil {
 				c.leaf.tsub = make(map[*subscription]struct{})
@@ -2007,9 +2010,6 @@ func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remot
 		}
 	}
 
-	var req *http.Request
-	var wsKey string
-
 	// For http request, we need the passed URL to contain either http or https scheme.
 	scheme := "http"
 	if tlsRequired {
@@ -2028,7 +2028,7 @@ func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remot
 	}
 	ustr := fmt.Sprintf("%s://%s%s", scheme, rURL.Host, path)
 	u, _ := url.Parse(ustr)
-	req = &http.Request{
+	req := &http.Request{
 		Method:     "GET",
 		URL:        u,
 		Proto:      "HTTP/1.1",

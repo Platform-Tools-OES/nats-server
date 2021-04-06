@@ -943,9 +943,6 @@ func (a *Account) addServiceExportWithResponseAndAccountPos(
 	}
 
 	if accounts != nil || accountPos > 0 {
-		if se == nil {
-			se = &serviceExport{}
-		}
 		if err := setExportAuth(&se.exportAuth, subject, accounts, accountPos); err != nil {
 			return err
 		}
@@ -1138,8 +1135,8 @@ type ServiceLatency struct {
 const ServiceLatencyType = "io.nats.server.metric.v1.service_latency"
 
 // NATSTotalTime is a helper function that totals the NATS latencies.
-func (nl *ServiceLatency) NATSTotalTime() time.Duration {
-	return nl.Requestor.RTT + nl.Responder.RTT + nl.SystemLatency
+func (m1 *ServiceLatency) NATSTotalTime() time.Duration {
+	return m1.Requestor.RTT + m1.Responder.RTT + m1.SystemLatency
 }
 
 // Merge function to merge m1 and m2 (requestor and responder) measurements
@@ -1337,7 +1334,7 @@ func (a *Account) updateAllClientsServiceExportResponseTime(lrt time.Duration) {
 // Read lock should be held.
 func (a *Account) lowestServiceExportResponseTime() time.Duration {
 	// Lowest we will allow is 5 minutes. Its an upper bound for this function.
-	lrt := time.Duration(5 * time.Minute)
+	lrt := 5 * time.Minute
 	for _, se := range a.exports.services {
 		if se.respThresh < lrt {
 			lrt = se.respThresh
@@ -1691,8 +1688,24 @@ func (a *Account) checkForReverseEntry(reply string, si *serviceImport, checkInt
 	}
 }
 
+// Checks to see if a potential service import subject is already overshadowed.
+func (a *Account) serviceImportShadowed(from string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.imports.services[from] != nil {
+		return true
+	}
+	// We did not find a direct match, so check individually.
+	for subj := range a.imports.services {
+		if subjectIsSubsetMatch(from, subj) {
+			return true
+		}
+	}
+	return false
+}
+
 // Internal check to see if a service import exists.
-func (a *Account) serviceImportExists(dest *Account, from string) bool {
+func (a *Account) serviceImportExists(from string) bool {
 	a.mu.RLock()
 	dup := a.imports.services[from]
 	a.mu.RUnlock()
@@ -1976,7 +1989,6 @@ func shouldSample(l *serviceLatency, c *client) (bool, http.Header) {
 // Used to mimic client like replies.
 const (
 	replyPrefix    = "_R_."
-	trackSuffix    = ".T"
 	replyPrefixLen = len(replyPrefix)
 	baseServerLen  = 10
 	replyLen       = 6
@@ -2102,9 +2114,7 @@ func (se *serviceExport) clearResponseThresholdTimer() bool {
 func (se *serviceExport) checkExpiredResponses() {
 	acc := se.acc
 	if acc == nil {
-		acc.mu.Lock()
 		se.clearResponseThresholdTimer()
-		acc.mu.Unlock()
 		return
 	}
 
@@ -2917,6 +2927,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 				s.Errorf("Error setting up jetstream service exports: %v", err)
 			}
 		}
+		s.checkJetStreamExports()
 	}
 
 	for _, e := range ac.Exports {
@@ -3137,7 +3148,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		a.jsLimits = nil
 	}
 
-	a.updated = time.Now()
+	a.updated = time.Now().UTC()
 	a.mu.Unlock()
 
 	clients := gatherClients()
@@ -3268,9 +3279,7 @@ func buildPermissionsFromJwt(uc *jwt.Permissions) *Permissions {
 	}
 	var p *Permissions
 	if len(uc.Pub.Allow) > 0 || len(uc.Pub.Deny) > 0 {
-		if p == nil {
-			p = &Permissions{}
-		}
+		p = &Permissions{}
 		p.Publish = &SubjectPermission{}
 		p.Publish.Allow = uc.Pub.Allow
 		p.Publish.Deny = uc.Pub.Deny
@@ -3311,8 +3320,6 @@ func buildInternalNkeyUser(uc *jwt.UserClaims, acts map[string]struct{}, acc *Ac
 	nu.Permissions = p
 	return nu
 }
-
-const fetchTimeout = 2 * time.Second
 
 func fetchAccount(res AccountResolver, name string) (string, error) {
 	if !nkeys.IsValidPublicAccountKey(name) {
@@ -3355,7 +3362,7 @@ func (*resolverDefaultsOpsImpl) Close() {
 }
 
 func (*resolverDefaultsOpsImpl) Store(_, _ string) error {
-	return fmt.Errorf("Store operation not supported for URL Resolver")
+	return fmt.Errorf("store operation not supported for URL Resolver")
 }
 
 // MemAccResolver is a memory only resolver.
@@ -3379,7 +3386,7 @@ func (m *MemAccResolver) Store(name, jwt string) error {
 	return nil
 }
 
-func (ur *MemAccResolver) IsReadOnly() bool {
+func (m *MemAccResolver) IsReadOnly() bool {
 	return false
 }
 
@@ -3403,7 +3410,7 @@ func NewURLAccResolver(url string) (*URLAccResolver, error) {
 	}
 	ur := &URLAccResolver{
 		url: url,
-		c:   &http.Client{Timeout: fetchTimeout, Transport: tr},
+		c:   &http.Client{Timeout: DEFAULT_ACCOUNT_FETCH_TIMEOUT, Transport: tr},
 	}
 	return ur, nil
 }
@@ -3433,6 +3440,7 @@ type DirAccResolver struct {
 	*DirJWTStore
 	*Server
 	syncInterval time.Duration
+	fetchTimeout time.Duration
 }
 
 func (dr *DirAccResolver) IsTrackingUpdate() bool {
@@ -3504,8 +3512,7 @@ func handleDeleteRequest(store *DirJWTStore, s *Server, msg []byte, reply string
 	if sysAcc := s.SystemAccount(); sysAcc != nil {
 		sysAccName = sysAcc.GetName()
 	}
-	// TODO Can allow keys (issuer) to delete accounts they issued and operator key to delete all accounts.
-	//      For now only operator is allowed to delete
+	// Only operator and operator signing key are allowed to delete
 	gk, err := jwt.DecodeGeneric(string(msg))
 	if err == nil {
 		subj = gk.Subject
@@ -3513,10 +3520,8 @@ func handleDeleteRequest(store *DirJWTStore, s *Server, msg []byte, reply string
 			err = fmt.Errorf("delete must be enabled in server config")
 		} else if subj != gk.Issuer {
 			err = fmt.Errorf("not self signed")
-		} else if !s.isTrustedIssuer(gk.Issuer) {
+		} else if _, ok := store.operator[gk.Issuer]; !ok {
 			err = fmt.Errorf("not trusted")
-		} else if store.operator != gk.Issuer {
-			err = fmt.Errorf("needs to be the operator operator")
 		} else if list, ok := gk.Data["accounts"]; !ok {
 			err = fmt.Errorf("malformed request")
 		} else if accIds, ok = list.([]interface{}); !ok {
@@ -3551,39 +3556,80 @@ func handleDeleteRequest(store *DirJWTStore, s *Server, msg []byte, reply string
 		respondToUpdate(s, reply, "", fmt.Sprintf("deleted %d accounts", passCnt), nil)
 	} else {
 		respondToUpdate(s, reply, "", fmt.Sprintf("deleted %d accounts, failed for %d", passCnt, len(errs)),
-			errors.New(strings.Join(errs, "<\n")))
+			errors.New(strings.Join(errs, "\n")))
 	}
 }
 
-func getOperator(s *Server) (string, bool, error) {
+func getOperatorKeys(s *Server) (string, map[string]struct{}, bool, error) {
 	var op string
 	var strict bool
+	keys := make(map[string]struct{})
 	if opts := s.getOpts(); opts != nil && len(opts.TrustedOperators) > 0 {
 		op = opts.TrustedOperators[0].Subject
 		strict = opts.TrustedOperators[0].StrictSigningKeyUsage
+		if !strict {
+			keys[opts.TrustedOperators[0].Subject] = struct{}{}
+		}
+		for _, key := range opts.TrustedOperators[0].SigningKeys {
+			keys[key] = struct{}{}
+		}
 	}
-	if op == "" {
-		return "", false, fmt.Errorf("no operator found")
+	if len(keys) == 0 {
+		return "", nil, false, fmt.Errorf("no operator key found")
 	}
-	return op, strict, nil
+	return op, keys, strict, nil
+}
+
+func claimValidate(claim *jwt.AccountClaims) error {
+	vr := &jwt.ValidationResults{}
+	claim.Validate(vr)
+	if vr.IsBlocking(false) {
+		return fmt.Errorf("validation errors: %v", vr.Errors())
+	}
+	return nil
+}
+
+func removeCb(s *Server, pubKey string) {
+	v, ok := s.accounts.Load(pubKey)
+	if !ok {
+		return
+	}
+	a := v.(*Account)
+	s.Debugf("Disable account %s due to remove", pubKey)
+	a.mu.Lock()
+	// lock out new clients
+	a.msubs = 0
+	a.mpay = 0
+	a.mconns = 0
+	a.mleafs = 0
+	a.updated = time.Now().UTC()
+	a.mu.Unlock()
+	// set the account to be expired and disconnect clients
+	a.expiredTimeout()
+	a.mu.Lock()
+	a.clearExpirationTimer()
+	a.mu.Unlock()
 }
 
 func (dr *DirAccResolver) Start(s *Server) error {
-	op, strict, err := getOperator(s)
+	op, opKeys, strict, err := getOperatorKeys(s)
 	if err != nil {
 		return err
 	}
 	dr.Lock()
 	defer dr.Unlock()
 	dr.Server = s
-	dr.operator = op
+	dr.operator = opKeys
 	dr.DirJWTStore.changed = func(pubKey string) {
 		if v, ok := s.accounts.Load(pubKey); !ok {
-		} else if jwt, err := dr.LoadAcc(pubKey); err != nil {
+		} else if theJwt, err := dr.LoadAcc(pubKey); err != nil {
 			s.Errorf("update got error on load: %v", err)
-		} else if err := s.updateAccountWithClaimJWT(v.(*Account), jwt); err != nil {
+		} else if err := s.updateAccountWithClaimJWT(v.(*Account), theJwt); err != nil {
 			s.Errorf("update resulted in error %v", err)
 		}
+	}
+	dr.DirJWTStore.deleted = func(pubKey string) {
+		removeCb(s, pubKey)
 	}
 	packRespIb := s.newRespInbox()
 	for _, reqSub := range []string{accUpdateEventSubjOld, accUpdateEventSubjNew} {
@@ -3600,7 +3646,9 @@ func (dr *DirAccResolver) Start(s *Server) error {
 				return
 			}
 			if claim, err := jwt.DecodeAccountClaims(string(msg)); err != nil {
-				respondToUpdate(s, resp, pubKey, "jwt update resulted in error", err)
+				respondToUpdate(s, resp, "n/a", "jwt update resulted in error", err)
+			} else if err := claimValidate(claim); err != nil {
+				respondToUpdate(s, resp, claim.Subject, "jwt validation failed", err)
 			} else if claim.Subject != pubKey {
 				err := errors.New("subject does not match jwt content")
 				respondToUpdate(s, resp, pubKey, "jwt update resulted in error", err)
@@ -3622,6 +3670,8 @@ func (dr *DirAccResolver) Start(s *Server) error {
 		} else if claim.Issuer == op && strict {
 			err := errors.New("operator requires issuer to be a signing key")
 			respondToUpdate(s, resp, claim.Subject, "jwt update resulted in error", err)
+		} else if err := claimValidate(claim); err != nil {
+			respondToUpdate(s, resp, claim.Subject, "jwt validation failed", err)
 		} else if err := dr.save(claim.Subject, string(msg)); err != nil {
 			respondToUpdate(s, resp, claim.Subject, "jwt update resulted in error", err)
 		} else {
@@ -3721,11 +3771,12 @@ func (dr *DirAccResolver) Fetch(name string) (string, error) {
 	} else {
 		dr.Lock()
 		srv := dr.Server
+		to := dr.fetchTimeout
 		dr.Unlock()
 		if srv == nil {
 			return "", err
 		}
-		return srv.fetch(dr, name) // lookup from other server
+		return srv.fetch(dr, name, to) // lookup from other server
 	}
 }
 
@@ -3733,7 +3784,29 @@ func (dr *DirAccResolver) Store(name, jwt string) error {
 	return dr.saveIfNewer(name, jwt)
 }
 
-func NewDirAccResolver(path string, limit int64, syncInterval time.Duration, delete bool) (*DirAccResolver, error) {
+type DirResOption func(s *DirAccResolver) error
+
+// limits the amount of time spent waiting for an account fetch to complete
+func FetchTimeout(to time.Duration) DirResOption {
+	return func(r *DirAccResolver) error {
+		if to <= time.Duration(0) {
+			return fmt.Errorf("Fetch timeout %v is too smal", to)
+		}
+		r.fetchTimeout = to
+		return nil
+	}
+}
+
+func (dr *DirAccResolver) apply(opts ...DirResOption) error {
+	for _, o := range opts {
+		if err := o(dr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func NewDirAccResolver(path string, limit int64, syncInterval time.Duration, delete bool, opts ...DirResOption) (*DirAccResolver, error) {
 	if limit == 0 {
 		limit = math.MaxInt64
 	}
@@ -3748,7 +3821,12 @@ func NewDirAccResolver(path string, limit int64, syncInterval time.Duration, del
 	if err != nil {
 		return nil, err
 	}
-	return &DirAccResolver{store, nil, syncInterval}, nil
+
+	res := &DirAccResolver{store, nil, syncInterval, DEFAULT_ACCOUNT_FETCH_TIMEOUT}
+	if err := res.apply(opts...); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 // Caching resolver using nats for lookups and making use of a directory for storage
@@ -3757,7 +3835,7 @@ type CacheDirAccResolver struct {
 	ttl time.Duration
 }
 
-func (s *Server) fetch(res AccountResolver, name string) (string, error) {
+func (s *Server) fetch(res AccountResolver, name string, timeout time.Duration) (string, error) {
 	if s == nil {
 		return "", ErrNoAccountResolver
 	}
@@ -3791,7 +3869,7 @@ func (s *Server) fetch(res AccountResolver, name string) (string, error) {
 	select {
 	case <-quit:
 		err = errors.New("fetching jwt failed due to shutdown")
-	case <-time.After(fetchTimeout):
+	case <-time.After(timeout):
 		err = errors.New("fetching jwt timed out")
 	case m := <-respC:
 		if err = res.Store(name, string(m)); err == nil {
@@ -3805,7 +3883,7 @@ func (s *Server) fetch(res AccountResolver, name string) (string, error) {
 	return theJWT, err
 }
 
-func NewCacheDirAccResolver(path string, limit int64, ttl time.Duration, _ ...dirJWTStoreOption) (*CacheDirAccResolver, error) {
+func NewCacheDirAccResolver(path string, limit int64, ttl time.Duration, opts ...DirResOption) (*CacheDirAccResolver, error) {
 	if limit <= 0 {
 		limit = 1_000
 	}
@@ -3813,25 +3891,32 @@ func NewCacheDirAccResolver(path string, limit int64, ttl time.Duration, _ ...di
 	if err != nil {
 		return nil, err
 	}
-	return &CacheDirAccResolver{DirAccResolver{store, nil, 0}, ttl}, nil
+	res := &CacheDirAccResolver{DirAccResolver{store, nil, 0, DEFAULT_ACCOUNT_FETCH_TIMEOUT}, ttl}
+	if err := res.apply(opts...); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 func (dr *CacheDirAccResolver) Start(s *Server) error {
-	op, strict, err := getOperator(s)
+	op, opKeys, strict, err := getOperatorKeys(s)
 	if err != nil {
 		return err
 	}
 	dr.Lock()
 	defer dr.Unlock()
 	dr.Server = s
-	dr.operator = op
+	dr.operator = opKeys
 	dr.DirJWTStore.changed = func(pubKey string) {
 		if v, ok := s.accounts.Load(pubKey); !ok {
-		} else if jwt, err := dr.LoadAcc(pubKey); err != nil {
+		} else if theJwt, err := dr.LoadAcc(pubKey); err != nil {
 			s.Errorf("update got error on load: %v", err)
-		} else if err := s.updateAccountWithClaimJWT(v.(*Account), jwt); err != nil {
+		} else if err := s.updateAccountWithClaimJWT(v.(*Account), theJwt); err != nil {
 			s.Errorf("update resulted in error %v", err)
 		}
+	}
+	dr.DirJWTStore.deleted = func(pubKey string) {
+		removeCb(s, pubKey)
 	}
 	for _, reqSub := range []string{accUpdateEventSubjOld, accUpdateEventSubjNew} {
 		// subscribe to account jwt update requests
@@ -3856,6 +3941,8 @@ func (dr *CacheDirAccResolver) Start(s *Server) error {
 				respondToUpdate(s, resp, pubKey, "jwt update cache resulted in error", err)
 			} else if _, ok := s.accounts.Load(pubKey); !ok {
 				respondToUpdate(s, resp, pubKey, "jwt update cache skipped", nil)
+			} else if err := claimValidate(claim); err != nil {
+				respondToUpdate(s, resp, claim.Subject, "jwt update cache validation failed", err)
 			} else if err := dr.save(pubKey, string(msg)); err != nil {
 				respondToUpdate(s, resp, pubKey, "jwt update cache resulted in error", err)
 			} else {
@@ -3873,6 +3960,8 @@ func (dr *CacheDirAccResolver) Start(s *Server) error {
 			respondToUpdate(s, resp, claim.Subject, "jwt update cache resulted in error", err)
 		} else if _, ok := s.accounts.Load(claim.Subject); !ok {
 			respondToUpdate(s, resp, claim.Subject, "jwt update cache skipped", nil)
+		} else if err := claimValidate(claim); err != nil {
+			respondToUpdate(s, resp, claim.Subject, "jwt update cache validation failed", err)
 		} else if err := dr.save(claim.Subject, string(msg)); err != nil {
 			respondToUpdate(s, resp, claim.Subject, "jwt update cache resulted in error", err)
 		} else {

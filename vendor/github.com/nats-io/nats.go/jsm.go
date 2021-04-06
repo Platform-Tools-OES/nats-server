@@ -14,50 +14,61 @@
 package nats
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 )
 
-// JetStreamManager is the public interface for managing JetStream streams & consumers.
+// JetStreamManager manages JetStream Streams and Consumers.
 type JetStreamManager interface {
-	// Create a stream.
-	AddStream(cfg *StreamConfig) (*StreamInfo, error)
+	// AddStream creates a stream.
+	AddStream(cfg *StreamConfig, opts ...JSOpt) (*StreamInfo, error)
 
-	// Update a stream.
-	UpdateStream(cfg *StreamConfig) (*StreamInfo, error)
+	// UpdateStream updates a stream.
+	UpdateStream(cfg *StreamConfig, opts ...JSOpt) (*StreamInfo, error)
 
-	// Delete a stream.
-	DeleteStream(name string) error
+	// DeleteStream deletes a stream.
+	DeleteStream(name string, opts ...JSOpt) error
 
-	// Stream information.
-	StreamInfo(stream string) (*StreamInfo, error)
+	// StreamInfo retrieves information from a stream.
+	StreamInfo(stream string, opts ...JSOpt) (*StreamInfo, error)
 
-	// Purge stream messages.
-	PurgeStream(name string) error
+	// PurgeStream purges a stream messages.
+	PurgeStream(name string, opts ...JSOpt) error
 
-	// NewStreamLister is used to return pages of StreamInfo objects.
-	NewStreamLister() *StreamLister
+	// StreamsInfo can be used to retrieve a list of StreamInfo objects.
+	StreamsInfo(opts ...JSOpt) <-chan *StreamInfo
 
-	// DeleteMsg erases a message from a Stream.
-	DeleteMsg(name string, seq uint64) error
+	// StreamNames is used to retrieve a list of Stream names.
+	StreamNames(opts ...JSOpt) <-chan string
 
-	// Create a consumer.
-	AddConsumer(stream string, cfg *ConsumerConfig) (*ConsumerInfo, error)
+	// GetMsg retrieves a raw stream message stored in JetStream by sequence number.
+	GetMsg(name string, seq uint64, opts ...JSOpt) (*RawStreamMsg, error)
 
-	// Delete a consumer.
-	DeleteConsumer(stream, consumer string) error
+	// DeleteMsg erases a message from a stream.
+	DeleteMsg(name string, seq uint64, opts ...JSOpt) error
 
-	// Consumer information.
-	ConsumerInfo(stream, name string) (*ConsumerInfo, error)
+	// AddConsumer adds a consumer to a stream.
+	AddConsumer(stream string, cfg *ConsumerConfig, opts ...JSOpt) (*ConsumerInfo, error)
 
-	// NewConsumerLister is used to return pages of ConsumerInfo objects.
-	NewConsumerLister(stream string) *ConsumerLister
+	// DeleteConsumer deletes a consumer.
+	DeleteConsumer(stream, consumer string, opts ...JSOpt) error
+
+	// ConsumerInfo retrieves information of a consumer from a stream.
+	ConsumerInfo(stream, name string, opts ...JSOpt) (*ConsumerInfo, error)
+
+	// ConsumersInfo is used to retrieve a list of ConsumerInfo objects.
+	ConsumersInfo(stream string, opts ...JSOpt) <-chan *ConsumerInfo
+
+	// ConsumerNames is used to retrieve a list of Consumer names.
+	ConsumerNames(stream string, opts ...JSOpt) <-chan string
 
 	// AccountInfo retrieves info about the JetStream usage from an account.
-	AccountInfo() (*AccountInfo, error)
+	AccountInfo(opts ...JSOpt) (*AccountInfo, error)
 }
 
 // StreamConfig will determine the properties for a stream.
@@ -78,6 +89,31 @@ type StreamConfig struct {
 	NoAck        bool            `json:"no_ack,omitempty"`
 	Template     string          `json:"template_owner,omitempty"`
 	Duplicates   time.Duration   `json:"duplicate_window,omitempty"`
+	Placement    *Placement      `json:"placement,omitempty"`
+	Mirror       *StreamSource   `json:"mirror,omitempty"`
+	Sources      []*StreamSource `json:"sources,omitempty"`
+}
+
+// Placement is used to guide placement of streams in clustered JetStream.
+type Placement struct {
+	Cluster string   `json:"cluster"`
+	Tags    []string `json:"tags,omitempty"`
+}
+
+// StreamSource dictates how streams can source from other streams.
+type StreamSource struct {
+	Name          string          `json:"name"`
+	OptStartSeq   uint64          `json:"opt_start_seq,omitempty"`
+	OptStartTime  *time.Time      `json:"opt_start_time,omitempty"`
+	FilterSubject string          `json:"filter_subject,omitempty"`
+	External      *ExternalStream `json:"external,omitempty"`
+}
+
+// ExternalStream allows you to qualify access to a stream source in another
+// account.
+type ExternalStream struct {
+	APIPrefix     string `json:"api"`
+	DeliverPrefix string `json:"deliver"`
 }
 
 // apiError is included in all API responses if there was an error.
@@ -107,10 +143,18 @@ type apiPagedRequest struct {
 
 // AccountInfo contains info about the JetStream usage from the current account.
 type AccountInfo struct {
-	Memory  uint64        `json:"memory"`
-	Store   uint64        `json:"storage"`
-	Streams int           `json:"streams"`
-	Limits  AccountLimits `json:"limits"`
+	Memory    uint64        `json:"memory"`
+	Store     uint64        `json:"storage"`
+	Streams   int           `json:"streams"`
+	Consumers int           `json:"consumers"`
+	API       APIStats      `json:"api"`
+	Limits    AccountLimits `json:"limits"`
+}
+
+// APIStats reports on API calls to JetStream for this account.
+type APIStats struct {
+	Total  uint64 `json:"total"`
+	Errors uint64 `json:"errors"`
 }
 
 // AccountLimits includes the JetStream limits of the current account.
@@ -127,8 +171,16 @@ type accountInfoResponse struct {
 }
 
 // AccountInfo retrieves info about the JetStream usage from the current account.
-func (js *js) AccountInfo() (*AccountInfo, error) {
-	resp, err := js.nc.Request(js.apiSubj(apiAccountInfo), nil, js.wait)
+func (js *js) AccountInfo(opts ...JSOpt) (*AccountInfo, error) {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
+	resp, err := js.nc.RequestWithContext(o.ctx, js.apiSubj(apiAccountInfo), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +212,15 @@ type consumerResponse struct {
 }
 
 // AddConsumer will add a JetStream consumer.
-func (js *js) AddConsumer(stream string, cfg *ConsumerConfig) (*ConsumerInfo, error) {
+func (js *js) AddConsumer(stream string, cfg *ConsumerConfig, opts ...JSOpt) (*ConsumerInfo, error) {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
 	if stream == _EMPTY_ {
 		return nil, ErrStreamNameRequired
 	}
@@ -179,7 +239,7 @@ func (js *js) AddConsumer(stream string, cfg *ConsumerConfig) (*ConsumerInfo, er
 		ccSubj = fmt.Sprintf(apiConsumerCreateT, stream)
 	}
 
-	resp, err := js.nc.Request(js.apiSubj(ccSubj), req, js.wait)
+	resp, err := js.nc.RequestWithContext(o.ctx, js.apiSubj(ccSubj), req)
 	if err != nil {
 		if err == ErrNoResponders {
 			err = ErrJetStreamNotEnabled
@@ -204,13 +264,21 @@ type consumerDeleteResponse struct {
 }
 
 // DeleteConsumer deletes a Consumer.
-func (js *js) DeleteConsumer(stream, durable string) error {
+func (js *js) DeleteConsumer(stream, consumer string, opts ...JSOpt) error {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
 	if stream == _EMPTY_ {
 		return ErrStreamNameRequired
 	}
 
-	dcSubj := js.apiSubj(fmt.Sprintf(apiConsumerDeleteT, stream, durable))
-	r, err := js.nc.Request(dcSubj, nil, js.wait)
+	dcSubj := js.apiSubj(fmt.Sprintf(apiConsumerDeleteT, stream, consumer))
+	r, err := js.nc.RequestWithContext(o.ctx, dcSubj, nil)
 	if err != nil {
 		return err
 	}
@@ -225,13 +293,20 @@ func (js *js) DeleteConsumer(stream, durable string) error {
 }
 
 // ConsumerInfo returns information about a Consumer.
-func (js *js) ConsumerInfo(stream, durable string) (*ConsumerInfo, error) {
-	return js.getConsumerInfo(stream, durable)
+func (js *js) ConsumerInfo(stream, consumer string, opts ...JSOpt) (*ConsumerInfo, error) {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+	return js.getConsumerInfoContext(o.ctx, stream, consumer)
 }
 
-// ConsumerLister fetches pages of ConsumerInfo objects. This object is not
+// consumerLister fetches pages of ConsumerInfo objects. This object is not
 // safe to use for multiple threads.
-type ConsumerLister struct {
+type consumerLister struct {
 	stream string
 	js     *js
 
@@ -254,7 +329,7 @@ type consumerListResponse struct {
 }
 
 // Next fetches the next ConsumerInfo page.
-func (c *ConsumerLister) Next() bool {
+func (c *consumerLister) Next() bool {
 	if c.err != nil {
 		return false
 	}
@@ -273,8 +348,16 @@ func (c *ConsumerLister) Next() bool {
 		c.err = err
 		return false
 	}
+
+	var cancel context.CancelFunc
+	ctx := c.js.opts.ctx
+	if ctx == nil {
+		ctx, cancel = context.WithTimeout(context.Background(), c.js.opts.wait)
+		defer cancel()
+	}
+
 	clSubj := c.js.apiSubj(fmt.Sprintf(apiConsumerListT, c.stream))
-	r, err := c.js.nc.Request(clSubj, req, c.js.wait)
+	r, err := c.js.nc.RequestWithContext(ctx, clSubj, req)
 	if err != nil {
 		c.err = err
 		return false
@@ -296,18 +379,138 @@ func (c *ConsumerLister) Next() bool {
 }
 
 // Page returns the current ConsumerInfo page.
-func (c *ConsumerLister) Page() []*ConsumerInfo {
+func (c *consumerLister) Page() []*ConsumerInfo {
 	return c.page
 }
 
 // Err returns any errors found while fetching pages.
-func (c *ConsumerLister) Err() error {
+func (c *consumerLister) Err() error {
 	return c.err
 }
 
-// NewConsumerLister is used to return pages of ConsumerInfo objects.
-func (js *js) NewConsumerLister(stream string) *ConsumerLister {
-	return &ConsumerLister{stream: stream, js: js}
+// ConsumersInfo is used to retrieve a list of ConsumerInfo objects.
+func (jsc *js) ConsumersInfo(stream string, opts ...JSOpt) <-chan *ConsumerInfo {
+	o, cancel, err := getJSContextOpts(jsc.opts, opts...)
+	if err != nil {
+		return nil
+	}
+
+	ch := make(chan *ConsumerInfo)
+	l := &consumerLister{js: &js{nc: jsc.nc, opts: o}, stream: stream}
+	go func() {
+		if cancel != nil {
+			defer cancel()
+		}
+		defer close(ch)
+		for l.Next() {
+			for _, info := range l.Page() {
+				select {
+				case ch <- info:
+				case <-o.ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	return ch
+}
+
+type consumerNamesLister struct {
+	stream string
+	js     *js
+
+	err      error
+	offset   int
+	page     []string
+	pageInfo *apiPaged
+}
+
+// consumerNamesListResponse is the response for a Consumers Names List request.
+type consumerNamesListResponse struct {
+	apiResponse
+	apiPaged
+	Consumers []string `json:"consumers"`
+}
+
+// Next fetches the next ConsumerInfo page.
+func (c *consumerNamesLister) Next() bool {
+	if c.err != nil {
+		return false
+	}
+	if c.stream == _EMPTY_ {
+		c.err = ErrStreamNameRequired
+		return false
+	}
+	if c.pageInfo != nil && c.offset >= c.pageInfo.Total {
+		return false
+	}
+
+	var cancel context.CancelFunc
+	ctx := c.js.opts.ctx
+	if ctx == nil {
+		ctx, cancel = context.WithTimeout(context.Background(), c.js.opts.wait)
+		defer cancel()
+	}
+
+	clSubj := c.js.apiSubj(fmt.Sprintf(apiConsumerNamesT, c.stream))
+	r, err := c.js.nc.RequestWithContext(ctx, clSubj, nil)
+	if err != nil {
+		c.err = err
+		return false
+	}
+	var resp consumerNamesListResponse
+	if err := json.Unmarshal(r.Data, &resp); err != nil {
+		c.err = err
+		return false
+	}
+	if resp.Error != nil {
+		c.err = errors.New(resp.Error.Description)
+		return false
+	}
+
+	c.pageInfo = &resp.apiPaged
+	c.page = resp.Consumers
+	c.offset += len(c.page)
+	return true
+}
+
+// Page returns the current ConsumerInfo page.
+func (c *consumerNamesLister) Page() []string {
+	return c.page
+}
+
+// Err returns any errors found while fetching pages.
+func (c *consumerNamesLister) Err() error {
+	return c.err
+}
+
+// ConsumerNames is used to retrieve a list of Consumer names.
+func (jsc *js) ConsumerNames(stream string, opts ...JSOpt) <-chan string {
+	o, cancel, err := getJSContextOpts(jsc.opts, opts...)
+	if err != nil {
+		return nil
+	}
+
+	ch := make(chan string)
+	l := &consumerNamesLister{stream: stream, js: &js{nc: jsc.nc, opts: o}}
+	go func() {
+		if cancel != nil {
+			defer cancel()
+		}
+		defer close(ch)
+		for l.Next() {
+			for _, info := range l.Page() {
+				select {
+				case ch <- info:
+				case <-o.ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	return ch
 }
 
 // streamCreateResponse stream creation.
@@ -316,7 +519,15 @@ type streamCreateResponse struct {
 	*StreamInfo
 }
 
-func (js *js) AddStream(cfg *StreamConfig) (*StreamInfo, error) {
+func (js *js) AddStream(cfg *StreamConfig, opts ...JSOpt) (*StreamInfo, error) {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
 	if cfg == nil || cfg.Name == _EMPTY_ {
 		return nil, ErrStreamNameRequired
 	}
@@ -327,7 +538,7 @@ func (js *js) AddStream(cfg *StreamConfig) (*StreamInfo, error) {
 	}
 
 	csSubj := js.apiSubj(fmt.Sprintf(apiStreamCreateT, cfg.Name))
-	r, err := js.nc.Request(csSubj, req, js.wait)
+	r, err := js.nc.RequestWithContext(o.ctx, csSubj, req)
 	if err != nil {
 		return nil, err
 	}
@@ -343,9 +554,17 @@ func (js *js) AddStream(cfg *StreamConfig) (*StreamInfo, error) {
 
 type streamInfoResponse = streamCreateResponse
 
-func (js *js) StreamInfo(stream string) (*StreamInfo, error) {
+func (js *js) StreamInfo(stream string, opts ...JSOpt) (*StreamInfo, error) {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
 	csSubj := js.apiSubj(fmt.Sprintf(apiStreamInfoT, stream))
-	r, err := js.nc.Request(csSubj, nil, js.wait)
+	r, err := js.nc.RequestWithContext(o.ctx, csSubj, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -361,13 +580,22 @@ func (js *js) StreamInfo(stream string) (*StreamInfo, error) {
 
 // StreamInfo shows config and current state for this stream.
 type StreamInfo struct {
-	Config  StreamConfig `json:"config"`
-	Created time.Time    `json:"created"`
-	State   StreamState  `json:"state"`
-	Cluster *ClusterInfo `json:"cluster,omitempty"`
+	Config  StreamConfig        `json:"config"`
+	Created time.Time           `json:"created"`
+	State   StreamState         `json:"state"`
+	Cluster *ClusterInfo        `json:"cluster,omitempty"`
+	Mirror  *StreamSourceInfo   `json:"mirror,omitempty"`
+	Sources []*StreamSourceInfo `json:"sources,omitempty"`
 }
 
-// StreamStats is information about the given stream.
+// StreamSourceInfo shows information about an upstream stream source.
+type StreamSourceInfo struct {
+	Name   string        `json:"name"`
+	Lag    uint64        `json:"lag"`
+	Active time.Duration `json:"active"`
+}
+
+// StreamState is information about the given stream.
 type StreamState struct {
 	Msgs      uint64    `json:"messages"`
 	Bytes     uint64    `json:"bytes"`
@@ -391,11 +619,21 @@ type ClusterInfo struct {
 type PeerInfo struct {
 	Name    string        `json:"name"`
 	Current bool          `json:"current"`
+	Offline bool          `json:"offline,omitempty"`
 	Active  time.Duration `json:"active"`
+	Lag     uint64        `json:"lag,omitempty"`
 }
 
 // UpdateStream updates a Stream.
-func (js *js) UpdateStream(cfg *StreamConfig) (*StreamInfo, error) {
+func (js *js) UpdateStream(cfg *StreamConfig, opts ...JSOpt) (*StreamInfo, error) {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
 	if cfg == nil || cfg.Name == _EMPTY_ {
 		return nil, ErrStreamNameRequired
 	}
@@ -406,7 +644,7 @@ func (js *js) UpdateStream(cfg *StreamConfig) (*StreamInfo, error) {
 	}
 
 	usSubj := js.apiSubj(fmt.Sprintf(apiStreamUpdateT, cfg.Name))
-	r, err := js.nc.Request(usSubj, req, js.wait)
+	r, err := js.nc.RequestWithContext(o.ctx, usSubj, req)
 	if err != nil {
 		return nil, err
 	}
@@ -427,13 +665,21 @@ type streamDeleteResponse struct {
 }
 
 // DeleteStream deletes a Stream.
-func (js *js) DeleteStream(name string) error {
+func (js *js) DeleteStream(name string, opts ...JSOpt) error {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
 	if name == _EMPTY_ {
 		return ErrStreamNameRequired
 	}
 
 	dsSubj := js.apiSubj(fmt.Sprintf(apiStreamDeleteT, name))
-	r, err := js.nc.Request(dsSubj, nil, js.wait)
+	r, err := js.nc.RequestWithContext(o.ctx, dsSubj, nil)
 	if err != nil {
 		return err
 	}
@@ -447,6 +693,87 @@ func (js *js) DeleteStream(name string) error {
 	return nil
 }
 
+type apiMsgGetRequest struct {
+	Seq uint64 `json:"seq"`
+}
+
+// RawStreamMsg is a raw message stored in JetStream.
+type RawStreamMsg struct {
+	Subject  string
+	Sequence uint64
+	Header   http.Header
+	Data     []byte
+	Time     time.Time
+}
+
+// storedMsg is a raw message stored in JetStream.
+type storedMsg struct {
+	Subject  string    `json:"subject"`
+	Sequence uint64    `json:"seq"`
+	Header   []byte    `json:"hdrs,omitempty"`
+	Data     []byte    `json:"data,omitempty"`
+	Time     time.Time `json:"time"`
+}
+
+// apiMsgGetResponse is the response for a Stream get request.
+type apiMsgGetResponse struct {
+	apiResponse
+	Message *storedMsg `json:"message,omitempty"`
+	Success bool       `json:"success,omitempty"`
+}
+
+// GetMsg retrieves a raw stream message stored in JetStream by sequence number.
+func (js *js) GetMsg(name string, seq uint64, opts ...JSOpt) (*RawStreamMsg, error) {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
+	if name == _EMPTY_ {
+		return nil, ErrStreamNameRequired
+	}
+
+	req, err := json.Marshal(&apiMsgGetRequest{Seq: seq})
+	if err != nil {
+		return nil, err
+	}
+
+	dsSubj := js.apiSubj(fmt.Sprintf(apiMsgGetT, name))
+	r, err := js.nc.RequestWithContext(o.ctx, dsSubj, req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp apiMsgGetResponse
+	if err := json.Unmarshal(r.Data, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, errors.New(resp.Error.Description)
+	}
+
+	msg := resp.Message
+
+	var hdr http.Header
+	if msg.Header != nil {
+		hdr, err = decodeHeadersMsg(msg.Header)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &RawStreamMsg{
+		Subject:  msg.Subject,
+		Sequence: msg.Sequence,
+		Header:   hdr,
+		Data:     msg.Data,
+		Time:     msg.Time,
+	}, nil
+}
+
 type msgDeleteRequest struct {
 	Seq uint64 `json:"seq"`
 }
@@ -458,7 +785,15 @@ type msgDeleteResponse struct {
 }
 
 // DeleteMsg deletes a message from a stream.
-func (js *js) DeleteMsg(name string, seq uint64) error {
+func (js *js) DeleteMsg(name string, seq uint64, opts ...JSOpt) error {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
 	if name == _EMPTY_ {
 		return ErrStreamNameRequired
 	}
@@ -469,7 +804,7 @@ func (js *js) DeleteMsg(name string, seq uint64) error {
 	}
 
 	dsSubj := js.apiSubj(fmt.Sprintf(apiMsgDeleteT, name))
-	r, err := js.nc.Request(dsSubj, req, js.wait)
+	r, err := js.nc.RequestWithContext(o.ctx, dsSubj, req)
 	if err != nil {
 		return err
 	}
@@ -490,9 +825,17 @@ type streamPurgeResponse struct {
 }
 
 // PurgeStream purges messages on a Stream.
-func (js *js) PurgeStream(name string) error {
+func (js *js) PurgeStream(name string, opts ...JSOpt) error {
+	o, cancel, err := getJSContextOpts(js.opts, opts...)
+	if err != nil {
+		return err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
 	psSubj := js.apiSubj(fmt.Sprintf(apiStreamPurgeT, name))
-	r, err := js.nc.Request(psSubj, nil, js.wait)
+	r, err := js.nc.RequestWithContext(o.ctx, psSubj, nil)
 	if err != nil {
 		return err
 	}
@@ -506,9 +849,9 @@ func (js *js) PurgeStream(name string) error {
 	return nil
 }
 
-// StreamLister fetches pages of StreamInfo objects. This object is not safe
+// streamLister fetches pages of StreamInfo objects. This object is not safe
 // to use for multiple threads.
-type StreamLister struct {
+type streamLister struct {
 	js   *js
 	page []*StreamInfo
 	err  error
@@ -533,7 +876,7 @@ type streamNamesRequest struct {
 }
 
 // Next fetches the next StreamInfo page.
-func (s *StreamLister) Next() bool {
+func (s *streamLister) Next() bool {
 	if s.err != nil {
 		return false
 	}
@@ -549,8 +892,15 @@ func (s *StreamLister) Next() bool {
 		return false
 	}
 
+	var cancel context.CancelFunc
+	ctx := s.js.opts.ctx
+	if ctx == nil {
+		ctx, cancel = context.WithTimeout(context.Background(), s.js.opts.wait)
+		defer cancel()
+	}
+
 	slSubj := s.js.apiSubj(apiStreamList)
-	r, err := s.js.nc.Request(slSubj, req, s.js.wait)
+	r, err := s.js.nc.RequestWithContext(ctx, slSubj, req)
 	if err != nil {
 		s.err = err
 		return false
@@ -572,16 +922,149 @@ func (s *StreamLister) Next() bool {
 }
 
 // Page returns the current StreamInfo page.
-func (s *StreamLister) Page() []*StreamInfo {
+func (s *streamLister) Page() []*StreamInfo {
 	return s.page
 }
 
 // Err returns any errors found while fetching pages.
-func (s *StreamLister) Err() error {
+func (s *streamLister) Err() error {
 	return s.err
 }
 
-// NewStreamLister is used to return pages of StreamInfo objects.
-func (js *js) NewStreamLister() *StreamLister {
-	return &StreamLister{js: js}
+// StreamsInfo can be used to retrieve a list of StreamInfo objects.
+func (jsc *js) StreamsInfo(opts ...JSOpt) <-chan *StreamInfo {
+	o, cancel, err := getJSContextOpts(jsc.opts, opts...)
+	if err != nil {
+		return nil
+	}
+
+	ch := make(chan *StreamInfo)
+	l := &streamLister{js: &js{nc: jsc.nc, opts: o}}
+	go func() {
+		if cancel != nil {
+			defer cancel()
+		}
+		defer close(ch)
+		for l.Next() {
+			for _, info := range l.Page() {
+				select {
+				case ch <- info:
+				case <-o.ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	return ch
+}
+
+type streamNamesLister struct {
+	js *js
+
+	err      error
+	offset   int
+	page     []string
+	pageInfo *apiPaged
+}
+
+// Next fetches the next ConsumerInfo page.
+func (l *streamNamesLister) Next() bool {
+	if l.err != nil {
+		return false
+	}
+	if l.pageInfo != nil && l.offset >= l.pageInfo.Total {
+		return false
+	}
+
+	var cancel context.CancelFunc
+	ctx := l.js.opts.ctx
+	if ctx == nil {
+		ctx, cancel = context.WithTimeout(context.Background(), l.js.opts.wait)
+		defer cancel()
+	}
+
+	r, err := l.js.nc.RequestWithContext(ctx, l.js.apiSubj(apiStreams), nil)
+	if err != nil {
+		l.err = err
+		return false
+	}
+	var resp streamNamesResponse
+	if err := json.Unmarshal(r.Data, &resp); err != nil {
+		l.err = err
+		return false
+	}
+	if resp.Error != nil {
+		l.err = errors.New(resp.Error.Description)
+		return false
+	}
+
+	l.pageInfo = &resp.apiPaged
+	l.page = resp.Streams
+	l.offset += len(l.page)
+	return true
+}
+
+// Page returns the current ConsumerInfo page.
+func (l *streamNamesLister) Page() []string {
+	return l.page
+}
+
+// Err returns any errors found while fetching pages.
+func (l *streamNamesLister) Err() error {
+	return l.err
+}
+
+// StreamNames is used to retrieve a list of Stream names.
+func (jsc *js) StreamNames(opts ...JSOpt) <-chan string {
+	o, cancel, err := getJSContextOpts(jsc.opts, opts...)
+	if err != nil {
+		return nil
+	}
+
+	ch := make(chan string)
+	l := &streamNamesLister{js: &js{nc: jsc.nc, opts: o}}
+	go func() {
+		if cancel != nil {
+			defer cancel()
+		}
+		defer close(ch)
+		for l.Next() {
+			for _, info := range l.Page() {
+				select {
+				case ch <- info:
+				case <-o.ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	return ch
+}
+
+func getJSContextOpts(defs *jsOpts, opts ...JSOpt) (*jsOpts, context.CancelFunc, error) {
+	var o jsOpts
+	for _, opt := range opts {
+		if err := opt.configureJSContext(&o); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// Check for option collisions. Right now just timeout and context.
+	if o.ctx != nil && o.wait != 0 {
+		return nil, nil, ErrContextAndTimeout
+	}
+	if o.wait == 0 && o.ctx == nil {
+		o.wait = defs.wait
+	}
+	var cancel context.CancelFunc
+	if o.ctx == nil && o.wait > 0 {
+		o.ctx, cancel = context.WithTimeout(context.Background(), o.wait)
+	}
+	if o.pre == "" {
+		o.pre = defs.pre
+	}
+
+	return &o, cancel, nil
 }
